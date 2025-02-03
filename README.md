@@ -1,14 +1,8 @@
 # Varnish-VCL-Config
 
-ACLs & Custom Error Page:
+ACLs
 
 – Purge and trusted network ACLs are defined.
-
-– A custom error page is provided to replace default “Guru Meditation” messages.
-
-Backend & Health Probe:
-
-– The backend is configured with a health probe to monitor the origin.
 
 Initialization:
 
@@ -19,6 +13,7 @@ Hashing:
 – The cache key is built from (restored) cookies, the X‑Forwarded‑Proto header, host (or server IP), and a canonical URL (without query strings). Logged‑in status is also incorporated.
 
 vcl_recv (Request Processing):
+
 – ACME challenge requests bypass caching.
 
 – Vulnerable headers (e.g. “proxy”) are unset.
