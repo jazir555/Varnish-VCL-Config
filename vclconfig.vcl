@@ -2,7 +2,7 @@ vcl 4.1;
 
 import std;
 import directors;
-import querystring;      # Advanced query string filtering VMOD
+import querystring;      # VMOD for advanced query string filtering
 import vsthrottle;
 
 ###############################################################################
@@ -82,7 +82,7 @@ backend default {
 sub vcl_init {
     new cluster = directors.round_robin();
     cluster.add_backend(default);
-    /* Optionally load extra runtime files */
+    /* Optionally load extra runtime files (e.g. blacklists, device detection) */
     new blacklist = std.file("/etc/varnish/blacklist.vcl", "text");
     new device_detect = std.file("/etc/varnish/device_detect.vcl", "text");
     return (ok);
@@ -102,7 +102,7 @@ sub vcl_hash {
     if (req.http.X-Forwarded-Proto) { 
         hash_data(req.http.X-Forwarded-Proto);
     }
-    if (req.http.host) {
+    if (req.http.host) { 
         hash_data(req.http.host);
     } else {
         hash_data(server.ip);
@@ -151,7 +151,7 @@ sub vcl_recv {
         set req.http.Host = regsub(req.http.Host, ":[0-9]+", "");
     }
     set req.url = std.querysort(req.url);
-    /* Remove tracking parameters (fbclid, gclid, utm_*, etc.) */
+    /* Remove tracking parameters (e.g. fbclid, gclid, utm_*, etc.) */
     if (req.url ~ "(\?|&)(_bta_[a-z]+|cof|cx|fbclid|gclid|ie|mc_[a-z]+|origin|siteurl|utm_[a-z]+|zanpid)=") {
          set req.url = regsuball(req.url, "(_bta_[a-z]+|cof|cx|fbclid|gclid|ie|mc_[a-z]+|origin|siteurl|utm_[a-z]+|zanpid)=[-_A-Za-z0-9+()%.]+&?", "");
          set req.url = regsub(req.url, "[?|&]+$", "");
@@ -182,7 +182,6 @@ sub vcl_recv {
 
     ##########################################
     # OPTIONAL: Do not cache logged–in users
-    # (Uncomment to bypass caching for users with a wordpress_logged_in cookie)
     ##########################################
     if (req.http.Cookie ~ "wordpress_logged_in") {
         return (pass);
@@ -196,24 +195,24 @@ sub vcl_recv {
     }
 
     ##########################################
-    # BASIC AUTH / Cookie check – do not cache if present
+    # BASIC AUTH / Cookie Check – Do Not Cache if Present
     ##########################################
     if (req.http.Authorization || req.http.Cookie) {
         return (pass);
     }
 
     ##########################################
-    # Accept-Encoding Adjustment
+    # Accept-Encoding Adjustment (Gzip/Deflate)
     ##########################################
     if (req.http.Accept-Encoding) {
-        if (req.url ~ "\.(jpg|jpeg|png|gif|gz|tgz|bz2|tbz|mp3|ogg|swf|mp4|flv)$") {
-            remove req.http.Accept-Encoding;
+        if (req.url ~ "\.(jpg|jpeg|png|gif|gz|tgz|bz2|tbz|mp3|mp4|ogg)$") {
+            unset req.http.Accept-Encoding;
         } elseif (req.http.Accept-Encoding ~ "gzip") {
             set req.http.Accept-Encoding = "gzip";
         } elseif (req.http.Accept-Encoding ~ "deflate") {
             set req.http.Accept-Encoding = "deflate";
         } else {
-            remove req.http.Accept-Encoding;
+            unset req.http.Accept-Encoding;
         }
     }
 
@@ -438,12 +437,16 @@ sub vcl_hash {
 # BACKEND RESPONSE PROCESSING (vcl_backend_response)
 ###############################################################################
 sub vcl_backend_response {
-    ############## ESI Support ##############
+    ##########################################
+    # ESI Support
+    ##########################################
     if (beresp.http.Surrogate-Control && beresp.http.Surrogate-Control ~ "ESI/1.0") {
         unset beresp.http.Surrogate-Control;
         set beresp.do_esi = true;
     }
-    ############## Vary Cache by User Roles ##############
+    ##########################################
+    # Vary Cache by User Roles
+    ##########################################
     if (bereq.http.X-User-Roles) {
         if (!beresp.http.Vary) {
             set beresp.http.Vary = "x-user-roles";
@@ -451,12 +454,16 @@ sub vcl_backend_response {
             set beresp.http.Vary = beresp.http.Vary + ", x-user-roles";
         }
     }
-    ############## Large Object Streaming ##############
+    ##########################################
+    # Large Object Streaming
+    ##########################################
     if (std.integer(beresp.http.Content-Length, 0) > 10485760) {
         set beresp.do_stream = true;
         set beresp.uncacheable = true;
     }
-    ############## Static Assets Optimization ##############
+    ##########################################
+    # Static Assets Optimization
+    ##########################################
     if (bereq.url ~ "(?i)\\.(jpg|jpeg|png|gif|ico|webp|svg|css|js|woff2?)$") {
         set beresp.ttl = 7d;
         set beresp.http.Cache-Control = "public, max-age=604800";
@@ -482,11 +489,15 @@ sub vcl_backend_response {
             set beresp.http.Location = regsub(beresp.http.Location, ":[0-9]+", "");
         }
     }
-    ############## Normalize Cache-Control ##############
+    ##########################################
+    # Normalize Cache-Control
+    ##########################################
     if (beresp.http.Cache-Control !~ "max-age" || beresp.http.Cache-Control ~ "max-age=0") {
         set beresp.http.Cache-Control = "public, max-age=180, stale-while-revalidate=360, stale-if-error=43200";
     }
-    ############## Fallback for Uncacheable Objects ##############
+    ##########################################
+    # Fallback for Uncacheable Objects
+    ##########################################
     if (beresp.ttl <= 0s || beresp.http.Set-Cookie || beresp.http.Vary == "*") {
         set beresp.ttl = 120s;
         set beresp.uncacheable = true;
@@ -503,7 +514,9 @@ sub vcl_backend_response {
 # DELIVERY (vcl_deliver)
 ###############################################################################
 sub vcl_deliver {
-    ############## Browser Caching Headers for Static Assets ##############
+    ##########################################
+    # Browser Caching Headers for Static Assets
+    ##########################################
     if (req.url ~ "\.(?:jpg|jpeg|png|gif|ico|cur|gz|svg|svgz|mp4|ogg|ogv|webm)$") {
         set resp.http.Expires = std.http_date(now + 30d);
         set resp.http.Cache-Control = "public";
@@ -517,8 +530,9 @@ sub vcl_deliver {
         set resp.http.Expires = std.http_date(now + 7d);
         set resp.http.Cache-Control = "public";
     }
-    ############## End Browser Caching Headers ##############
-
+    ##########################################
+    # End Browser Caching Headers
+    ##########################################
     if (obj.hits > 0) {
         set resp.http.X-Cache = "HIT";
     } else {
@@ -603,8 +617,6 @@ sub vcl_pass {
 # (Optional) VCL_HIT for Handling Stale Content
 ###############################################################################
 sub vcl_hit {
-    /* If the cached object is fresh, deliver it.
-       Otherwise, if it is stale but within grace, deliver stale content. */
     if (obj.ttl >= 0s) {
         return (deliver);
     }
