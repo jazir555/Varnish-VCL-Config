@@ -81,7 +81,7 @@ backend default {
 sub vcl_init {
     new cluster = directors.round_robin();
     cluster.add_backend(default);
-    /* Load extra runtime files if needed (e.g. blacklists, device detection) */
+    /* Optionally load extra runtime files (e.g. blacklists, device detection) */
     new blacklist = std.file("/etc/varnish/blacklist.vcl", "text");
     new device_detect = std.file("/etc/varnish/device_detect.vcl", "text");
 }
@@ -96,11 +96,7 @@ sub vcl_hash {
     }
     if (req.http.Cookie) { hash_data(req.http.Cookie); }
     if (req.http.X-Forwarded-Proto) { hash_data(req.http.X-Forwarded-Proto); }
-    if (req.http.host) {
-        hash_data(req.http.host);
-    } else {
-        hash_data(server.ip);
-    }
+    if (req.http.host) { hash_data(req.http.host); } else { hash_data(server.ip); }
     /* Canonicalize URL by stripping any query string */
     set req.http.ccsuri = regsub(req.url, "\?.*$", "");
     hash_data(req.http.ccsuri);
@@ -123,6 +119,13 @@ sub vcl_backend_fetch {
 ###############################################################################
 sub vcl_recv {
     ##########################################
+    # LetsEncrypt Certbot Passthrough
+    ##########################################
+    if (req.url ~ "^/\\.well-known/acme-challenge/") {
+        return (pass);
+    }
+
+    ##########################################
     # URL & Header Normalization
     ##########################################
     std.collect(req.http.Cookie);
@@ -144,7 +147,6 @@ sub vcl_recv {
             return (synth(405, "Not allowed."));
         }
         ban("req.url ~ " + req.url + " && req.http.Host == " + req.http.Host);
-        /* Improvement: if a non‑PURGE request is flagged, restart with X-Purge header */
         if (req.method != "PURGE") {
             set req.http.X-Purge = "Yes";
             return (restart);
@@ -416,10 +418,15 @@ sub vcl_backend_response {
         if (!(bereq.url ~ "(?i)wp-(login|admin)|cart|checkout|my-account|wc-api|resetpass") &&
             !beresp.http.Set-Cookie) {
             unset beresp.http.Set-Cookie;
-            if (bereq.http.X-Logged-In) { set beresp.ttl = 2h; set beresp.grace = 1h; }
-            else {
-                if (bereq.url ~ "^/article/") { set beresp.ttl = 5m; }
-                else { set beresp.ttl = 45m; }
+            if (bereq.http.X-Logged-In) { 
+                set beresp.ttl = 2h; 
+                set beresp.grace = 1h; 
+            } else {
+                if (bereq.url ~ "^/article/") { 
+                    set beresp.ttl = 5m; 
+                } else { 
+                    set beresp.ttl = 45m; 
+                }
                 set beresp.grace = 6h;
             }
         }
@@ -510,6 +517,30 @@ sub vcl_pipe {
     return (pipe);
 }
 sub vcl_pass { return (pass); }
+
+###############################################################################
+# (Optional) VCL_HIT for handling stale content
+###############################################################################
+sub vcl_hit {
+    /* If the cached object is fresh, deliver it. Otherwise, if it is stale but within grace, deliver stale content. */
+    if (obj.ttl >= 0s) { return (deliver); }
+    if (std.healthy(req.backend_hint)) {
+        if (obj.ttl + 10s > 0s) { return (deliver); }
+    } else {
+        if (obj.ttl + obj.grace > 0s) { return (deliver); }
+    }
+    return (miss);
+}
+
+###############################################################################
+# (Optional) VCL_BACKEND_ERROR for serving a custom error page if backend is down
+###############################################################################
+sub vcl_backend_error {
+    if (beresp.status == 503 && bereq.retries == 3) {
+        synthetic(std.fileread("/etc/varnish/error503.html"));
+        return (deliver);
+    }
+}
 
 ###############################################################################
 # VCL FINI
