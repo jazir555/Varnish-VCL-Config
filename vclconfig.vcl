@@ -573,16 +573,6 @@ sub vcl_hit {
 }
 
 ###############################################################################
-# (Optional) VCL_BACKEND_ERROR for Custom Error Page if Backend is Down
-###############################################################################
-sub vcl_backend_error {
-    if (beresp.status == 503 && bereq.retries == 3) {
-        synthetic(std.fileread("/etc/varnish/error503.html"));
-        return (deliver);
-    }
-}
-
-###############################################################################
 # VCL FINI
 ###############################################################################
 sub vcl_fini {
