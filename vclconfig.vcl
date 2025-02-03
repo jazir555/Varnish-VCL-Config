@@ -1,0 +1,553 @@
+vcl 4.1;
+import std;
+import directors;
+import querystring;      # VMOD required for advanced query string filtering
+import vsthrottle;
+
+###############################################################################
+# ACLs & VARIABLES
+###############################################################################
+acl purge {
+    "localhost";
+    "127.0.0.1";
+    "192.168.1.100";   // or replace with your actual purge IP(s) such as Web.Server.IP
+}
+
+acl trusted_networks {
+    "localhost";
+    "127.0.0.1";
+    "192.168.1.0/24";  // adjust as needed for your trusted networks
+}
+
+###############################################################################
+# CUSTOM ERROR PAGE
+###############################################################################
+sub generate_error_page {
+    set resp.http.Content-Type = "text/html; charset=utf-8";
+    synthetic ({"<!DOCTYPE html>
+<html lang=\"en\">
+<head>
+    <meta charset=\"utf-8\">
+    <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">
+    <title>"} + resp.status + " " + resp.reason + {"</title>
+    <style>
+        body { font-family: -apple-system, system-ui, BlinkMacSystemFont, \"Segoe UI\", Roboto, \"Helvetica Neue\", sans-serif; line-height: 1.5; padding: 2rem; max-width: 45rem; margin: 0 auto; color: #333; }
+        h1 { color: #e53e3e; margin-bottom: 1rem; }
+        hr { border: 0; border-top: 1px solid #eee; margin: 2rem 0; }
+        .error-code { color: #718096; font-size: 0.875rem; }
+    </style>
+</head>
+<body>
+    <h1>Error "} + resp.status + {"</h1>
+    <p>"} + resp.reason + {"</p>
+    <hr>
+    <p class=\"error-code\">Error Code: "} + resp.status + {"</p>
+</body>
+</html>
+"});
+}
+
+###############################################################################
+# BACKEND DEFINITIONS
+###############################################################################
+# Health check probe definition
+probe backend_probe {
+    .request =
+        "HEAD /health HTTP/1.1"
+        "Host: example.com"
+        "Connection: close"
+        "User-Agent: Varnish Health Probe"
+        "Accept-Encoding: gzip";
+    .interval = 5s;
+    .timeout = 2s;
+    .window = 5;
+    .threshold = 3;
+    .initial = 2;
+    .expected_response = 200;
+}
+
+backend default {
+    .host = "192.168.1.50";  // adjust as needed
+    .port = "8080";
+    .first_byte_timeout = 300s;
+    .between_bytes_timeout = 60s;
+    .connect_timeout = 5s;
+    .max_connections = 800;  // Prevent backend overload
+    .probe = backend_probe;
+}
+
+/*
+Additional backend definitions can be added here.
+For example:
+backend secondary {
+    .host = "192.168.1.51";
+    .port = "8080";
+    ...
+}
+*/
+
+###############################################################################
+# VCL INIT
+###############################################################################
+sub vcl_init {
+    # Initialize a round-robin director for load balancing
+    new cluster = directors.round_robin();
+    cluster.add_backend(default);
+    # Load additional runtime files as needed (e.g. blacklists)
+    new blacklist = std.file("/etc/varnish/blacklist.vcl", "text");
+    new device_detect = std.file("/etc/varnish/device_detect.vcl", "text");
+}
+
+###############################################################################
+# HASH FUNCTION (REQUIRED)
+###############################################################################
+sub vcl_hash {
+    # If a backup cookie exists (from earlier modifications), restore it
+    if (req.http.Cookie-Backup) {
+        set req.http.Cookie = req.http.Cookie-Backup;
+        unset req.http.Cookie-Backup;
+    }
+    if (req.http.Cookie) {
+        hash_data(req.http.Cookie);
+    }
+    if (req.http.X-Forwarded-Proto) {
+        hash_data(req.http.X-Forwarded-Proto);
+    }
+    if (req.http.host) {
+        hash_data(req.http.host);
+    } else {
+        hash_data(server.ip);
+    }
+    # Canonicalize URL by stripping query strings
+    set req.http.ccsuri = regsub(req.url, "\?.*$", "");
+    hash_data(req.http.ccsuri);
+    # Vary cache key for logged-in users if applicable
+    if (req.http.X-Logged-In) {
+        hash_data(req.http.X-Logged-In);
+    }
+    return (lookup);
+}
+
+###############################################################################
+# CLIENT REQUEST PROCESSING (vcl_recv)
+###############################################################################
+sub vcl_recv {
+    ##########################################
+    # URL & Header Normalization
+    ##########################################
+    # Remove URL fragments and trailing "?" if present
+    if (req.url ~ "#") { 
+        set req.url = regsub(req.url, "#.*", ""); 
+    }
+    if (req.url ~ "\?$") { 
+        set req.url = regsub(req.url, "\?$", ""); 
+    }
+    # Remove any port from Host header
+    if (req.http.Host) { 
+        set req.http.Host = regsub(req.http.Host, ":[0-9]+", ""); 
+    }
+    # Sort query parameters
+    set req.url = std.querysort(req.url);
+
+    # Force bypass caching if "nocache=1" is present in the URL
+    if (req.url ~ "(?i)nocache=1") {
+        return (pass);
+    }
+
+    ##########################################
+    # PURGE Requests
+    ##########################################
+    if (req.method == "PURGE") {
+        if (client.ip !~ purge) { 
+            return (synth(405, "Not allowed."));
+        }
+        ban("req.url ~ " + req.url + " && req.http.Host == " + req.http.Host);
+        return (synth(200, "Purged"));
+    }
+
+    ##########################################
+    # HTTPS Redirection (if listening on insecure port)
+    ##########################################
+    if (std.port(server.ip) == 6080) {
+        set req.http.x-redir = "https://" + req.http.Host + req.url;
+        return (synth(301, req.http.x-redir));
+    }
+
+    ##########################################
+    # Security & Bot Protection
+    ##########################################
+    # Block bad bots and known malicious User-Agents
+    if (req.http.User-Agent ~ "(?i)(bot|crawl|slurp|spider|libwww|wget|curl)"
+        && !req.http.User-Agent ~ "(?i)(googlebot|bingbot|yandex|baiduspider)") {
+        return (synth(403, "Bot Access Denied"));
+    }
+    # Rate limiting using vsthrottle
+    if (vsthrottle.is_denied(client.identity, 200, 60s)) {
+        return (synth(429, "Too Many Requests"));
+    }
+
+    ##########################################
+    # Forwarding & Backend Selection
+    ##########################################
+    # Set backend using the director (round-robin)
+    set req.backend_hint = cluster.backend();
+    set req.http.X-Real-IP = client.ip;
+    # Update X-Forwarded-For header
+    if (req.http.X-Forwarded-For) {
+        set req.http.X-Forwarded-For = req.http.X-Forwarded-For + ", " + client.ip;
+    } else {
+        set req.http.X-Forwarded-For = client.ip;
+    }
+    # Indicate protocol (assuming HTTPS for secure connections)
+    set req.http.X-Forwarded-Proto = "https";
+
+    ##########################################
+    # Method & Authorization Check
+    ##########################################
+    if (req.method != "GET" && req.method != "HEAD") { 
+        return (pass);
+    }
+    if (req.http.Authorization) { 
+        return (pass);
+    }
+
+    ##########################################
+    # CMS & WooCommerce / WordPress Optimizations
+    ##########################################
+    # For dynamic endpoints (e.g. shop, product, category, blog, search, REST API)
+    if (req.method == "GET" &&
+        (req.url ~ "^/(shop|product|category|tag|archive|blog|page|search|wp-json)") &&
+        req.url !~ "\?add-to-cart=" &&
+        req.url !~ "wc-ajax|get_refreshed_fragments" &&
+        req.url !~ "(cart|checkout|my-account|wc-api|resetpass|wp-admin|xmlrpc.php|customer-area|preview=true)") {
+
+        # Bypass caching for certain REST API endpoints
+        if (req.url ~ "^/wp-json/wp/v2/users/me") {
+            return (pass);
+        }
+        if (req.http.Cookie ~ "wordpress_logged_in") {
+            # For logged-in users, vary cache by user role
+            if (req.http.Cookie ~ "user_roles=") {
+                set req.http.X-User-Roles = regsub(req.http.Cookie, "^.*?user_roles=([^;]+);*.*$", "\1");
+            } else {
+                set req.http.X-User-Roles = "loggedin";
+            }
+            set req.http.X-Logged-In = "true";
+            set req.http.Cookie-Backup = req.http.Cookie;
+            unset req.http.Cookie;
+        } else if (req.http.Cookie) {
+            # For guest users, extract user roles if available
+            if (req.http.Cookie ~ "user_roles=") {
+                set req.http.X-User-Roles = regsub(req.http.Cookie, "^.*?user_roles=([^;]+);*.*$", "\1");
+            } else {
+                set req.http.X-User-Roles = "guest";
+            }
+            set req.http.Cookie-Backup = req.http.Cookie;
+            unset req.http.Cookie;
+        }
+    }
+
+    # Cache AJAX GET responses for non-sensitive requests
+    if (req.method == "GET" &&
+        req.url ~ "admin-ajax.php" &&
+        !req.http.Cookie ~ "wordpress_logged_in") {
+        return (lookup);
+    }
+
+    ##########################################
+    # Cookie & Tracking Cleanup
+    ##########################################
+    set req.http.Cookie = regsuball(req.http.Cookie, "has_js=[^;]+(; )?", "");
+    set req.http.Cookie = regsuball(req.http.Cookie, "__utm\\w+=[^;]+(; )?", "");
+    set req.http.Cookie = regsuball(req.http.Cookie, "_ga=[^;]+(; )?", "");
+    set req.http.Cookie = regsuball(req.http.Cookie, "_gat=[^;]+(; )?", "");
+    set req.http.Cookie = regsuball(req.http.Cookie, "utmctr=[^;]+(; )?", "");
+    set req.http.Cookie = regsuball(req.http.Cookie, "utmcmd=[^;]+(; )?", "");
+    set req.http.Cookie = regsuball(req.http.Cookie, "utmccn=[^;]+(; )?", "");
+    set req.http.Cookie = regsuball(req.http.Cookie, "__gads=[^;]+(; )?", "");
+    set req.http.Cookie = regsuball(req.http.Cookie, "__qc\\w+=[^;]+(; )?", "");
+    set req.http.Cookie = regsuball(req.http.Cookie, "__atuv\\w*=[^;]+(; )?", "");
+    set req.http.Cookie = regsuball(req.http.Cookie, "^;\\s*", "");
+    if (req.http.Cookie ~ "^\s*$") { unset req.http.Cookie; }
+
+    ##########################################
+    # Static Assets Handling
+    ##########################################
+    if (req.url ~ "^[^?]*\\.(7z|avi|bmp|bz2|css|csv|doc|docx|eot|flac|flv|gif|gz|ico|jpe?g|js|less|mka|mkv|mov|mp3|mp4|mpeg|mpg|odt|otf|ogg|ogm|opus|pdf|png|ppt|pptx|rar|rtf|svg|svgz|swf|tar|tbz|tgz|ttf|txt|txz|wav|webm|webp|woff|woff2|xls|xlsx|xml|xz|zip)(\\?.*)?$") {
+        unset req.http.Cookie;
+        if (querystring.exists(req.url)) {
+            set req.url = querystring.remove(req.url);
+        } else {
+            set req.url = regsub(req.url, "\\?.*$", "");
+        }
+        return (hash);
+    }
+
+    ##########################################
+    # CMS-Specific Bypass for Sensitive Endpoints
+    ##########################################
+    if (req.url ~ "(wp-(login|admin)|wc-ajax|get_refreshed_fragments|cart|checkout|my-account|wc-api|resetpass|xmlrpc.php|customer-area)" ||
+        req.url ~ "preview=true") {
+        return (pass);
+    }
+    if (req.http.Cookie && req.http.Cookie ~ "(wordpress_|wp-settings-)") {
+        # For logged-in users on sensitive endpoints, always pass
+        if (req.url ~ "(cart|checkout|my-account|wc-api|resetpass|wp-admin|xmlrpc.php)") {
+            return (pass);
+        } else {
+            if (req.http.Cookie ~ "user_roles=") {
+                set req.http.X-User-Roles = regsub(req.http.Cookie, "^.*?user_roles=([^;]+);*.*$", "\1");
+            } else {
+                set req.http.X-User-Roles = "loggedin";
+            }
+            set req.http.X-Logged-In = "true";
+            set req.http.Cookie-Backup = req.http.Cookie;
+            unset req.http.Cookie;
+        }
+    } else {
+        unset req.http.Cookie;
+    }
+
+    ##########################################
+    # Query String Filtering & Sorting
+    ##########################################
+    set req.url = querystring.filter_except(req.url,
+        "sort"          + querystring.filtersep() +
+        "q"             + querystring.filtersep() +
+        "dom"           + querystring.filtersep() +
+        "dedupe_hl"     + querystring.filtersep() +
+        "filter"        + querystring.filtersep() +
+        "attachment"    + querystring.filtersep() +
+        "attachment_id" + querystring.filtersep() +
+        "author"        + querystring.filtersep() +
+        "author_name"   + querystring.filtersep() +
+        "cat"           + querystring.filtersep() +
+        "calendar"      + querystring.filtersep() +
+        "category_name" + querystring.filtersep() +
+        "comments_popup"+ querystring.filtersep() +
+        "cpage"         + querystring.filtersep() +
+        "day"           + querystring.filtersep() +
+        "error"         + querystring.filtersep() +
+        "exact"         + querystring.filtersep() +
+        "exclude"       + querystring.filtersep() +
+        "feed"          + querystring.filtersep() +
+        "hour"          + querystring.filtersep() +
+        "m"             + querystring.filtersep() +
+        "minute"        + querystring.filtersep() +
+        "monthnum"      + querystring.filtersep() +
+        "more"          + querystring.filtersep() +
+        "name"          + querystring.filtersep() +
+        "order"         + querystring.filtersep() +
+        "orderby"       + querystring.filtersep() +
+        "p"             + querystring.filtersep() +
+        "page_id"       + querystring.filtersep() +
+        "page"          + querystring.filtersep() +
+        "paged"         + querystring.filtersep() +
+        "pagename"      + querystring.filtersep() +
+        "pb"            + querystring.filtersep() +
+        "post_type"     + querystring.filtersep() +
+        "posts"         + querystring.filtersep() +
+        "preview"       + querystring.filtersep() +
+        "q"             + querystring.filtersep() +
+        "robots"        + querystring.filtersep() +
+        "s"             + querystring.filtersep() +
+        "search"        + querystring.filtersep() +
+        "second"        + querystring.filtersep() +
+        "sentence"      + querystring.filtersep() +
+        "static"        + querystring.filtersep() +
+        "subpost"       + querystring.filtersep() +
+        "subpost_id"    + querystring.filtersep() +
+        "taxonomy"      + querystring.filtersep() +
+        "tag"           + querystring.filtersep() +
+        "tb"            + querystring.filtersep() +
+        "tag_id"        + querystring.filtersep() +
+        "term"          + querystring.filtersep() +
+        "url"           + querystring.filtersep() +
+        "w"             + querystring.filtersep() +
+        "withcomments"  + querystring.filtersep() +
+        "withoutcomments" + querystring.filtersep() +
+        "year"
+    );
+    if (req.url ~ "\?") { set req.url = querystring.sort(req.url); }
+
+    ##########################################
+    # WebSocket & HTTP Method Handling
+    ##########################################
+    if (req.http.Upgrade && req.http.Upgrade ~ "(?i)websocket") { 
+        return (pipe); 
+    }
+    if (req.method != "GET" && req.method != "HEAD") { 
+        return (pass); 
+    }
+    if (req.http.Authorization) { 
+        return (pass); 
+    }
+
+    ##########################################
+    # ESI Support & X-Forwarded-For Update
+    ##########################################
+    set req.http.Surrogate-Capability = "key=ESI/1.0";
+    if (req.restarts == 0) {
+        if (req.http.X-Forwarded-For) {
+            set req.http.X-Forwarded-For = req.http.X-Forwarded-For + ", " + client.ip;
+        } else {
+            set req.http.X-Forwarded-For = client.ip;
+        }
+    }
+    return (hash);
+}
+
+###############################################################################
+# BACKEND RESPONSE PROCESSING (vcl_backend_response)
+###############################################################################
+sub vcl_backend_response {
+    ##########################################
+    # ESI Support & Vary Adjustments
+    ##########################################
+    if (beresp.http.Surrogate-Control && beresp.http.Surrogate-Control ~ "ESI/1.0") {
+        unset beresp.http.Surrogate-Control;
+        set beresp.do_esi = true;
+    }
+    if (bereq.http.X-User-Roles) {
+        if (!beresp.http.Vary) {
+            set beresp.http.Vary = "x-user-roles";
+        } else if (beresp.http.Vary !~ "x-user-roles") {
+            set beresp.http.Vary = beresp.http.Vary + ", x-user-roles";
+        }
+    }
+
+    ##########################################
+    # Streaming & Caching
+    ##########################################
+    if (std.integer(beresp.http.Content-Length, 0) > 10485760) {
+        set beresp.do_stream = true;
+        set beresp.uncacheable = true;
+    }
+    if (bereq.url ~ "(?i)\\.(jpg|jpeg|png|gif|ico|webp|svg|css|js|woff2?)$") {
+        set beresp.ttl = 7d;
+        set beresp.http.Cache-Control = "public, max-age=604800";
+        set beresp.http.Vary = "Accept-Encoding";
+        unset beresp.http.set-cookie;
+    } else {
+        if (!(bereq.url ~ "(?i)wp-(login|admin)|cart|checkout|my-account|wc-api|resetpass|xmlrpc.php") &&
+            !beresp.http.Set-Cookie) {
+            unset beresp.http.set-cookie;
+            if (bereq.http.X-Logged-In) {
+                set beresp.ttl = 2h;
+                set beresp.grace = 1h;
+            } else {
+                set beresp.ttl = 1h;
+                set beresp.grace = 6h;
+            }
+        }
+        if (beresp.status == 301 || beresp.status == 302) {
+            set beresp.http.Location = regsub(beresp.http.Location, ":[0-9]+", "");
+        }
+    }
+    if (beresp.ttl <= 0s || beresp.http.Set-Cookie || beresp.http.Vary == "*") {
+        set beresp.ttl = 120s;
+        set beresp.uncacheable = true;
+        return (deliver);
+    }
+    if (beresp.status >= 500 && beresp.status < 600) {
+        return (abandon);
+    }
+    ##########################################
+    # Security Headers
+    ##########################################
+    set beresp.http.X-Content-Type-Options = "nosniff";
+    set beresp.http.X-Frame-Options = "SAMEORIGIN";
+    set beresp.http.X-XSS-Protection = "1; mode=block";
+    set beresp.http.Referrer-Policy = "strict-origin-when-cross-origin";
+    # Store backend name for debugging
+    set beresp.http.X-Backend = beresp.backend.name;
+    return (deliver);
+}
+
+###############################################################################
+# DELIVERY (vcl_deliver)
+###############################################################################
+sub vcl_deliver {
+    set resp.http.Strict-Transport-Security = "max-age=31536000; includeSubDomains; preload";
+    unset resp.http.Server;
+    unset resp.http.X-Powered-By;
+    unset resp.http.Via;
+    unset resp.http.X-Varnish;
+    if (client.ip ~ trusted_networks) {
+        set resp.http.X-Cache = obj.hits > 0 ? "HIT" : "MISS";
+        set resp.http.X-Cache-Hits = obj.hits;
+        set resp.http.X-Served-By = server.hostname;
+        if (obj.http.X-Backend) {
+            set resp.http.X-Backend = obj.http.X-Backend;
+        }
+    }
+    if (req.http.X-User-Roles) {
+        set resp.http.X-User-Roles = req.http.X-User-Roles;
+    }
+    if (req.http.sticky) {
+        if (!resp.http.Set-Cookie) { 
+            set resp.http.Set-Cookie = ""; 
+        }
+        set resp.http.Set-Cookie = "ccsvs=ccs" + req.http.sticky + "; Expires=" + (now + 10d) + ";" + resp.http.Set-Cookie;
+    }
+    set resp.http.Timing-Allow-Origin = "*";
+    return (deliver);
+}
+
+###############################################################################
+# SYNTHETIC RESPONSES (vcl_synth)
+###############################################################################
+sub vcl_synth {
+    if (resp.status == 301 || resp.status == 302) {
+        set resp.http.Location = resp.reason;
+        set resp.reason = "Redirecting...";
+        call generate_error_page;
+        return (deliver);
+    } else if (resp.status == 720) {
+        set resp.http.Location = resp.reason;
+        set resp.status = 301;
+        return (deliver);
+    } else if (resp.status == 721) {
+        set resp.http.Location = resp.reason;
+        set resp.status = 302;
+        return (deliver);
+    } else if (resp.status == 8201) {
+        set resp.http.Access-Control-Allow-Origin = "*";
+        set resp.http.Content-Type = "text/plain";
+        synthetic(resp.reason);
+        return (deliver);
+    }
+    if (resp.status == 429) {
+        set resp.http.Retry-After = "60";
+    }
+    call generate_error_page;
+    return (deliver);
+}
+
+###############################################################################
+# PURGE HANDLING (vcl_purge)
+###############################################################################
+sub vcl_purge {
+    return (synth(200, "Purged"));
+}
+
+###############################################################################
+# PIPE & PASS MODES
+###############################################################################
+sub vcl_pipe {
+    set bereq.http.Connection = "close";
+    if (req.http.upgrade) { 
+        set bereq.http.upgrade = req.http.upgrade; 
+    }
+    return (pipe);
+}
+sub vcl_pass { 
+    return (pass);
+}
+
+###############################################################################
+# VCL FINI
+###############################################################################
+sub vcl_fini { 
+    return (ok);
+}
