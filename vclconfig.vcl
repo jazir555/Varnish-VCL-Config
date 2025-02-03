@@ -21,51 +21,8 @@ acl trusted_networks {
 }
 
 ###############################################################################
-# CUSTOM ERROR PAGE
+# BACKEND DEFINITIONS 
 ###############################################################################
-sub generate_error_page {
-    set resp.http.Content-Type = "text/html; charset=utf-8";
-    synthetic ({"<!DOCTYPE html>
-<html lang=\"en\">
-  <head>
-    <meta charset=\"utf-8\">
-    <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">
-    <title>"} + resp.status + " " + resp.reason + {"</title>
-    <style>
-      body { font-family: -apple-system, system-ui, BlinkMacSystemFont, \"Segoe UI\", Roboto, \"Helvetica Neue\", sans-serif;
-             line-height: 1.5; padding: 2rem; max-width: 45rem; margin: 0 auto; color: #333; }
-      h1 { color: #e53e3e; margin-bottom: 1rem; }
-      hr { border: 0; border-top: 1px solid #eee; margin: 2rem 0; }
-      .error-code { color: #718096; font-size: 0.875rem; }
-    </style>
-  </head>
-  <body>
-    <h1>Error "} + resp.status + {"</h1>
-    <p>"} + resp.reason + {"</p>
-    <hr>
-    <p class=\"error-code\">Error Code: "} + resp.status + {"</p>
-  </body>
-</html>
-"});
-}
-
-###############################################################################
-# BACKEND DEFINITIONS & HEALTH PROBE
-###############################################################################
-probe backend_probe {
-    .request =
-        "HEAD /health HTTP/1.1"
-        "Host: example.com"
-        "Connection: close"
-        "User-Agent: Varnish Health Probe"
-        "Accept-Encoding: gzip";
-    .interval = 5s;
-    .timeout = 2s;
-    .window = 5;
-    .threshold = 3;
-    .initial = 2;
-    .expected_response = 200;
-}
 
 backend default {
     .host = "192.168.1.50";  // Adjust to your content server
