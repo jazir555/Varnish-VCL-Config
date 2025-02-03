@@ -1,7 +1,7 @@
 vcl 4.1;
 import std;
 import directors;
-import querystring;      # VMOD required for advanced query string filtering
+import querystring;      # Advanced query string filtering VMOD
 import vsthrottle;
 
 ###############################################################################
@@ -10,13 +10,13 @@ import vsthrottle;
 acl purge {
     "localhost";
     "127.0.0.1";
-    "192.168.1.100";   // or replace with your actual purge IP(s) such as Web.Server.IP
+    "192.168.1.100";   // REPLACE with your actual purge IP(s)
 }
 
 acl trusted_networks {
     "localhost";
     "127.0.0.1";
-    "192.168.1.0/24";  // adjust as needed for your trusted networks
+    "192.168.1.0/24";  // Adjust for your trusted networks
 }
 
 ###############################################################################
@@ -27,21 +27,21 @@ sub generate_error_page {
     synthetic ({"<!DOCTYPE html>
 <html lang=\"en\">
 <head>
-    <meta charset=\"utf-8\">
-    <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">
-    <title>"} + resp.status + " " + resp.reason + {"</title>
-    <style>
-        body { font-family: -apple-system, system-ui, BlinkMacSystemFont, \"Segoe UI\", Roboto, \"Helvetica Neue\", sans-serif; line-height: 1.5; padding: 2rem; max-width: 45rem; margin: 0 auto; color: #333; }
-        h1 { color: #e53e3e; margin-bottom: 1rem; }
-        hr { border: 0; border-top: 1px solid #eee; margin: 2rem 0; }
-        .error-code { color: #718096; font-size: 0.875rem; }
-    </style>
+  <meta charset=\"utf-8\">
+  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">
+  <title>"} + resp.status + " " + resp.reason + {"</title>
+  <style>
+    body { font-family: -apple-system, system-ui, BlinkMacSystemFont, \"Segoe UI\", Roboto, \"Helvetica Neue\", sans-serif; line-height: 1.5; padding: 2rem; max-width: 45rem; margin: 0 auto; color: #333; }
+    h1 { color: #e53e3e; margin-bottom: 1rem; }
+    hr { border: 0; border-top: 1px solid #eee; margin: 2rem 0; }
+    .error-code { color: #718096; font-size: 0.875rem; }
+  </style>
 </head>
 <body>
-    <h1>Error "} + resp.status + {"</h1>
-    <p>"} + resp.reason + {"</p>
-    <hr>
-    <p class=\"error-code\">Error Code: "} + resp.status + {"</p>
+  <h1>Error "} + resp.status + {"</h1>
+  <p>"} + resp.reason + {"</p>
+  <hr>
+  <p class=\"error-code\">Error Code: "} + resp.status + {"</p>
 </body>
 </html>
 "});
@@ -50,7 +50,6 @@ sub generate_error_page {
 ###############################################################################
 # BACKEND DEFINITIONS
 ###############################################################################
-# Health check probe definition
 probe backend_probe {
     .request =
         "HEAD /health HTTP/1.1"
@@ -67,33 +66,22 @@ probe backend_probe {
 }
 
 backend default {
-    .host = "192.168.1.50";  // adjust as needed
-    .port = "8080";
+    .host = "192.168.1.50";  // Adjust to your content server
+    .port = "8080";          // Adjust as needed
     .first_byte_timeout = 300s;
     .between_bytes_timeout = 60s;
     .connect_timeout = 5s;
-    .max_connections = 800;  // Prevent backend overload
+    .max_connections = 800;
     .probe = backend_probe;
 }
-
-/*
-Additional backend definitions can be added here.
-For example:
-backend secondary {
-    .host = "192.168.1.51";
-    .port = "8080";
-    ...
-}
-*/
 
 ###############################################################################
 # VCL INIT
 ###############################################################################
 sub vcl_init {
-    # Initialize a round-robin director for load balancing
     new cluster = directors.round_robin();
     cluster.add_backend(default);
-    # Load additional runtime files as needed (e.g. blacklists)
+    /* Load extra runtime files if needed (e.g. blacklists, device detection) */
     new blacklist = std.file("/etc/varnish/blacklist.vcl", "text");
     new device_detect = std.file("/etc/varnish/device_detect.vcl", "text");
 }
@@ -102,30 +90,32 @@ sub vcl_init {
 # HASH FUNCTION (REQUIRED)
 ###############################################################################
 sub vcl_hash {
-    # If a backup cookie exists (from earlier modifications), restore it
     if (req.http.Cookie-Backup) {
         set req.http.Cookie = req.http.Cookie-Backup;
         unset req.http.Cookie-Backup;
     }
-    if (req.http.Cookie) {
-        hash_data(req.http.Cookie);
-    }
-    if (req.http.X-Forwarded-Proto) {
-        hash_data(req.http.X-Forwarded-Proto);
-    }
+    if (req.http.Cookie) { hash_data(req.http.Cookie); }
+    if (req.http.X-Forwarded-Proto) { hash_data(req.http.X-Forwarded-Proto); }
     if (req.http.host) {
         hash_data(req.http.host);
     } else {
         hash_data(server.ip);
     }
-    # Canonicalize URL by stripping query strings
+    /* Canonicalize URL by stripping any query string */
     set req.http.ccsuri = regsub(req.url, "\?.*$", "");
     hash_data(req.http.ccsuri);
-    # Vary cache key for logged-in users if applicable
-    if (req.http.X-Logged-In) {
-        hash_data(req.http.X-Logged-In);
-    }
+    if (req.http.X-Logged-In) { hash_data(req.http.X-Logged-In); }
     return (lookup);
+}
+
+###############################################################################
+# BACKEND FETCH / MISS
+###############################################################################
+sub vcl_miss { 
+    return (fetch); 
+}
+sub vcl_backend_fetch { 
+    return (fetch); 
 }
 
 ###############################################################################
@@ -135,24 +125,16 @@ sub vcl_recv {
     ##########################################
     # URL & Header Normalization
     ##########################################
-    # Remove URL fragments and trailing "?" if present
-    if (req.url ~ "#") { 
-        set req.url = regsub(req.url, "#.*", ""); 
-    }
-    if (req.url ~ "\?$") { 
-        set req.url = regsub(req.url, "\?$", ""); 
-    }
-    # Remove any port from Host header
-    if (req.http.Host) { 
-        set req.http.Host = regsub(req.http.Host, ":[0-9]+", ""); 
-    }
-    # Sort query parameters
+    std.collect(req.http.Cookie);
+    if (req.url ~ "#") { set req.url = regsub(req.url, "#.*", ""); }
+    if (req.url ~ "\?$") { set req.url = regsub(req.url, "\?$", ""); }
+    if (req.http.Host) { set req.http.Host = regsub(req.http.Host, ":[0-9]+", ""); }
     set req.url = std.querysort(req.url);
-
-    # Force bypass caching if "nocache=1" is present in the URL
-    if (req.url ~ "(?i)nocache=1") {
-        return (pass);
+    if (req.url ~ "(\?|&)(_bta_[a-z]+|cof|cx|fbclid|gclid|ie|mc_[a-z]+|origin|siteurl|utm_[a-z]+|zanpid)=") {
+         set req.url = regsuball(req.url, "(_bta_[a-z]+|cof|cx|fbclid|gclid|ie|mc_[a-z]+|origin|siteurl|utm_[a-z]+|zanpid)=[-_A-Za-z0-9+()%.]+&?", "");
+         set req.url = regsub(req.url, "[?|&]+$", "");
     }
+    if (req.url ~ "(?i)nocache=1") { return (pass); }
 
     ##########################################
     # PURGE Requests
@@ -162,11 +144,16 @@ sub vcl_recv {
             return (synth(405, "Not allowed."));
         }
         ban("req.url ~ " + req.url + " && req.http.Host == " + req.http.Host);
+        /* Improvement: if a non‑PURGE request is flagged, restart with X-Purge header */
+        if (req.method != "PURGE") {
+            set req.http.X-Purge = "Yes";
+            return (restart);
+        }
         return (synth(200, "Purged"));
     }
 
     ##########################################
-    # HTTPS Redirection (if listening on insecure port)
+    # HTTPS Redirection (if on insecure port)
     ##########################################
     if (std.port(server.ip) == 6080) {
         set req.http.x-redir = "https://" + req.http.Host + req.url;
@@ -176,12 +163,10 @@ sub vcl_recv {
     ##########################################
     # Security & Bot Protection
     ##########################################
-    # Block bad bots and known malicious User-Agents
-    if (req.http.User-Agent ~ "(?i)(bot|crawl|slurp|spider|libwww|wget|curl)"
-        && !req.http.User-Agent ~ "(?i)(googlebot|bingbot|yandex|baiduspider)") {
+    if (req.http.User-Agent ~ "(?i)(bot|crawl|slurp|spider|libwww|wget|curl)" &&
+        !req.http.User-Agent ~ "(?i)(googlebot|bingbot|yandex|baiduspider)") {
         return (synth(403, "Bot Access Denied"));
     }
-    # Rate limiting using vsthrottle
     if (vsthrottle.is_denied(client.identity, 200, 60s)) {
         return (synth(429, "Too Many Requests"));
     }
@@ -189,44 +174,46 @@ sub vcl_recv {
     ##########################################
     # Forwarding & Backend Selection
     ##########################################
-    # Set backend using the director (round-robin)
     set req.backend_hint = cluster.backend();
     set req.http.X-Real-IP = client.ip;
-    # Update X-Forwarded-For header
     if (req.http.X-Forwarded-For) {
-        set req.http.X-Forwarded-For = req.http.X-Forwarded-For + ", " + client.ip;
+         set req.http.X-Forwarded-For = req.http.X-Forwarded-For + ", " + client.ip;
     } else {
-        set req.http.X-Forwarded-For = client.ip;
+         set req.http.X-Forwarded-For = client.ip;
     }
-    # Indicate protocol (assuming HTTPS for secure connections)
     set req.http.X-Forwarded-Proto = "https";
 
     ##########################################
     # Method & Authorization Check
     ##########################################
-    if (req.method != "GET" && req.method != "HEAD") { 
-        return (pass);
-    }
-    if (req.http.Authorization) { 
-        return (pass);
+    if (req.method != "GET" && req.method != "HEAD") { return (pass); }
+    if (req.http.Authorization) { return (pass); }
+
+    ##########################################
+    # Accept-Encoding Adjustment
+    ##########################################
+    if (req.http.Accept-Encoding) {
+        if (req.url ~ "\.(jpg|jpeg|png|gif|gz|tgz|bz2|tbz|mp3|ogg|swf|mp4|flv)$") {
+            remove req.http.Accept-Encoding;
+        } elseif (req.http.Accept-Encoding ~ "gzip") {
+            set req.http.Accept-Encoding = "gzip";
+        } elseif (req.http.Accept-Encoding ~ "deflate") {
+            set req.http.Accept-Encoding = "deflate";
+        } else {
+            remove req.http.Accept-Encoding;
+        }
     }
 
     ##########################################
-    # CMS & WooCommerce / WordPress Optimizations
+    # CMS & Dynamic Content Optimizations
     ##########################################
-    # For dynamic endpoints (e.g. shop, product, category, blog, search, REST API)
     if (req.method == "GET" &&
-        (req.url ~ "^/(shop|product|category|tag|archive|blog|page|search|wp-json)") &&
+        (req.url ~ "^/(shop|product|category|tag|archive|blog|page|search|wp-json|feed)") &&
         req.url !~ "\?add-to-cart=" &&
         req.url !~ "wc-ajax|get_refreshed_fragments" &&
-        req.url !~ "(cart|checkout|my-account|wc-api|resetpass|wp-admin|xmlrpc.php|customer-area|preview=true)") {
-
-        # Bypass caching for certain REST API endpoints
-        if (req.url ~ "^/wp-json/wp/v2/users/me") {
-            return (pass);
-        }
+        req.url !~ "(cart|checkout|my-account|wc-api|resetpass|wp-admin|xmlrpc.php|customer-area|addons)") {
+        if (req.url ~ "^/wp-json/wp/v2/users/me") { return (pass); }
         if (req.http.Cookie ~ "wordpress_logged_in") {
-            # For logged-in users, vary cache by user role
             if (req.http.Cookie ~ "user_roles=") {
                 set req.http.X-User-Roles = regsub(req.http.Cookie, "^.*?user_roles=([^;]+);*.*$", "\1");
             } else {
@@ -236,7 +223,6 @@ sub vcl_recv {
             set req.http.Cookie-Backup = req.http.Cookie;
             unset req.http.Cookie;
         } else if (req.http.Cookie) {
-            # For guest users, extract user roles if available
             if (req.http.Cookie ~ "user_roles=") {
                 set req.http.X-User-Roles = regsub(req.http.Cookie, "^.*?user_roles=([^;]+);*.*$", "\1");
             } else {
@@ -246,8 +232,6 @@ sub vcl_recv {
             unset req.http.Cookie;
         }
     }
-
-    # Cache AJAX GET responses for non-sensitive requests
     if (req.method == "GET" &&
         req.url ~ "admin-ajax.php" &&
         !req.http.Cookie ~ "wordpress_logged_in") {
@@ -257,7 +241,7 @@ sub vcl_recv {
     ##########################################
     # Cookie & Tracking Cleanup
     ##########################################
-    set req.http.Cookie = regsuball(req.http.Cookie, "has_js=[^;]+(; )?", "");
+    set req.http.Cookie = regsuball(req.http.Cookie, "(^|;\\s*)(__[a-z]+|has_js)=[^;]*", "");
     set req.http.Cookie = regsuball(req.http.Cookie, "__utm\\w+=[^;]+(; )?", "");
     set req.http.Cookie = regsuball(req.http.Cookie, "_ga=[^;]+(; )?", "");
     set req.http.Cookie = regsuball(req.http.Cookie, "_gat=[^;]+(; )?", "");
@@ -267,7 +251,7 @@ sub vcl_recv {
     set req.http.Cookie = regsuball(req.http.Cookie, "__gads=[^;]+(; )?", "");
     set req.http.Cookie = regsuball(req.http.Cookie, "__qc\\w+=[^;]+(; )?", "");
     set req.http.Cookie = regsuball(req.http.Cookie, "__atuv\\w*=[^;]+(; )?", "");
-    set req.http.Cookie = regsuball(req.http.Cookie, "^;\\s*", "");
+    set req.http.Cookie = regsub(req.http.Cookie, "^;\\s*", "");
     if (req.http.Cookie ~ "^\s*$") { unset req.http.Cookie; }
 
     ##########################################
@@ -286,12 +270,10 @@ sub vcl_recv {
     ##########################################
     # CMS-Specific Bypass for Sensitive Endpoints
     ##########################################
-    if (req.url ~ "(wp-(login|admin)|wc-ajax|get_refreshed_fragments|cart|checkout|my-account|wc-api|resetpass|xmlrpc.php|customer-area)" ||
-        req.url ~ "preview=true") {
+    if (req.url ~ "(wp-(login|admin)|wc-ajax|get_refreshed_fragments|cart|checkout|my-account|wc-api|resetpass|xmlrpc.php|customer-area|preview=true)") {
         return (pass);
     }
     if (req.http.Cookie && req.http.Cookie ~ "(wordpress_|wp-settings-)") {
-        # For logged-in users on sensitive endpoints, always pass
         if (req.url ~ "(cart|checkout|my-account|wc-api|resetpass|wp-admin|xmlrpc.php)") {
             return (pass);
         } else {
@@ -373,18 +355,12 @@ sub vcl_recv {
     ##########################################
     # WebSocket & HTTP Method Handling
     ##########################################
-    if (req.http.Upgrade && req.http.Upgrade ~ "(?i)websocket") { 
-        return (pipe); 
-    }
-    if (req.method != "GET" && req.method != "HEAD") { 
-        return (pass); 
-    }
-    if (req.http.Authorization) { 
-        return (pass); 
-    }
+    if (req.http.Upgrade && req.http.Upgrade ~ "(?i)websocket") { return (pipe); }
+    if (req.method != "GET" && req.method != "HEAD") { return (pass); }
+    if (req.http.Authorization) { return (pass); }
 
     ##########################################
-    # ESI Support & X-Forwarded-For Update
+    # ESI Support & Final X-Forwarded-For Update
     ##########################################
     set req.http.Surrogate-Capability = "key=ESI/1.0";
     if (req.restarts == 0) {
@@ -394,31 +370,39 @@ sub vcl_recv {
             set req.http.X-Forwarded-For = client.ip;
         }
     }
+    set req.grace = 60s;
     return (hash);
+}
+
+###############################################################################
+# HASHING (vcl_hash)
+###############################################################################
+sub vcl_hash {
+    if (req.http.Cookie-Backup) {
+        set req.http.Cookie = req.http.Cookie-Backup;
+        unset req.http.Cookie-Backup;
+    }
+    if (req.http.Cookie) { hash_data(req.http.Cookie); }
+    if (req.http.x-forwarded-proto) { hash_data(req.http.x-forwarded-proto); }
+    if (req.http.host) { hash_data(req.http.host); } else { hash_data(server.ip); }
+    set req.http.ccsuri = regsub(req.url, "\?.*$", "");
+    hash_data(req.http.ccsuri);
+    if (req.http.X-Logged-In) { hash_data(req.http.X-Logged-In); }
+    return;
 }
 
 ###############################################################################
 # BACKEND RESPONSE PROCESSING (vcl_backend_response)
 ###############################################################################
 sub vcl_backend_response {
-    ##########################################
-    # ESI Support & Vary Adjustments
-    ##########################################
     if (beresp.http.Surrogate-Control && beresp.http.Surrogate-Control ~ "ESI/1.0") {
         unset beresp.http.Surrogate-Control;
         set beresp.do_esi = true;
     }
     if (bereq.http.X-User-Roles) {
-        if (!beresp.http.Vary) {
-            set beresp.http.Vary = "x-user-roles";
-        } else if (beresp.http.Vary !~ "x-user-roles") {
-            set beresp.http.Vary = beresp.http.Vary + ", x-user-roles";
-        }
+        if (!beresp.http.Vary) { set beresp.http.Vary = "x-user-roles"; }
+        else if (beresp.http.Vary !~ "x-user-roles") { set beresp.http.Vary = beresp.http.Vary + ", x-user-roles"; }
     }
-
-    ##########################################
-    # Streaming & Caching
-    ##########################################
     if (std.integer(beresp.http.Content-Length, 0) > 10485760) {
         set beresp.do_stream = true;
         set beresp.uncacheable = true;
@@ -427,16 +411,15 @@ sub vcl_backend_response {
         set beresp.ttl = 7d;
         set beresp.http.Cache-Control = "public, max-age=604800";
         set beresp.http.Vary = "Accept-Encoding";
-        unset beresp.http.set-cookie;
+        unset beresp.http.Set-Cookie;
     } else {
-        if (!(bereq.url ~ "(?i)wp-(login|admin)|cart|checkout|my-account|wc-api|resetpass|xmlrpc.php") &&
+        if (!(bereq.url ~ "(?i)wp-(login|admin)|cart|checkout|my-account|wc-api|resetpass") &&
             !beresp.http.Set-Cookie) {
-            unset beresp.http.set-cookie;
-            if (bereq.http.X-Logged-In) {
-                set beresp.ttl = 2h;
-                set beresp.grace = 1h;
-            } else {
-                set beresp.ttl = 1h;
+            unset beresp.http.Set-Cookie;
+            if (bereq.http.X-Logged-In) { set beresp.ttl = 2h; set beresp.grace = 1h; }
+            else {
+                if (bereq.url ~ "^/article/") { set beresp.ttl = 5m; }
+                else { set beresp.ttl = 45m; }
                 set beresp.grace = 6h;
             }
         }
@@ -444,23 +427,16 @@ sub vcl_backend_response {
             set beresp.http.Location = regsub(beresp.http.Location, ":[0-9]+", "");
         }
     }
+    if (beresp.http.Cache-Control !~ "max-age" || beresp.http.Cache-Control ~ "max-age=0") {
+        set beresp.http.Cache-Control = "public, max-age=180, stale-while-revalidate=360, stale-if-error=43200";
+    }
     if (beresp.ttl <= 0s || beresp.http.Set-Cookie || beresp.http.Vary == "*") {
         set beresp.ttl = 120s;
         set beresp.uncacheable = true;
         return (deliver);
     }
-    if (beresp.status >= 500 && beresp.status < 600) {
-        return (abandon);
-    }
-    ##########################################
-    # Security Headers
-    ##########################################
-    set beresp.http.X-Content-Type-Options = "nosniff";
-    set beresp.http.X-Frame-Options = "SAMEORIGIN";
-    set beresp.http.X-XSS-Protection = "1; mode=block";
-    set beresp.http.Referrer-Policy = "strict-origin-when-cross-origin";
-    # Store backend name for debugging
-    set beresp.http.X-Backend = beresp.backend.name;
+    if (beresp.status >= 500 && beresp.status < 600) { return (abandon); }
+    set beresp.grace = 6h;
     return (deliver);
 }
 
@@ -468,28 +444,20 @@ sub vcl_backend_response {
 # DELIVERY (vcl_deliver)
 ###############################################################################
 sub vcl_deliver {
-    set resp.http.Strict-Transport-Security = "max-age=31536000; includeSubDomains; preload";
-    unset resp.http.Server;
-    unset resp.http.X-Powered-By;
-    unset resp.http.Via;
-    unset resp.http.X-Varnish;
-    if (client.ip ~ trusted_networks) {
-        set resp.http.X-Cache = obj.hits > 0 ? "HIT" : "MISS";
-        set resp.http.X-Cache-Hits = obj.hits;
-        set resp.http.X-Served-By = server.hostname;
-        if (obj.http.X-Backend) {
-            set resp.http.X-Backend = obj.http.X-Backend;
-        }
-    }
-    if (req.http.X-User-Roles) {
-        set resp.http.X-User-Roles = req.http.X-User-Roles;
-    }
+    if (obj.hits > 0) { set resp.http.X-Cache = "HIT"; }
+    else { set resp.http.X-Cache = "MISS"; }
+    set resp.http.X-Cache-Hits = obj.hits;
+    if (req.http.X-User-Roles) { set resp.http.X-User-Roles = req.http.X-User-Roles; }
     if (req.http.sticky) {
-        if (!resp.http.Set-Cookie) { 
-            set resp.http.Set-Cookie = ""; 
-        }
+        if (!resp.http.Set-Cookie) { set resp.http.Set-Cookie = ""; }
         set resp.http.Set-Cookie = "ccsvs=ccs" + req.http.sticky + "; Expires=" + (now + 10d) + ";" + resp.http.Set-Cookie;
     }
+    unset resp.http.X-Powered-By;
+    unset resp.http.X-Drupal-Cache;
+    unset resp.http.X-Varnish;
+    unset resp.http.Via;
+    unset resp.http.Link;
+    unset resp.http.X-Generator;
     set resp.http.Timing-Allow-Origin = "*";
     return (deliver);
 }
@@ -517,9 +485,7 @@ sub vcl_synth {
         synthetic(resp.reason);
         return (deliver);
     }
-    if (resp.status == 429) {
-        set resp.http.Retry-After = "60";
-    }
+    if (resp.status == 429) { set resp.http.Retry-After = "60"; }
     call generate_error_page;
     return (deliver);
 }
@@ -528,6 +494,10 @@ sub vcl_synth {
 # PURGE HANDLING (vcl_purge)
 ###############################################################################
 sub vcl_purge {
+    if (req.method != "PURGE") {
+        set req.http.X-Purge = "Yes";
+        return (restart);
+    }
     return (synth(200, "Purged"));
 }
 
@@ -536,18 +506,12 @@ sub vcl_purge {
 ###############################################################################
 sub vcl_pipe {
     set bereq.http.Connection = "close";
-    if (req.http.upgrade) { 
-        set bereq.http.upgrade = req.http.upgrade; 
-    }
+    if (req.http.upgrade) { set bereq.http.upgrade = req.http.upgrade; }
     return (pipe);
 }
-sub vcl_pass { 
-    return (pass);
-}
+sub vcl_pass { return (pass); }
 
 ###############################################################################
 # VCL FINI
 ###############################################################################
-sub vcl_fini { 
-    return (ok);
-}
+sub vcl_fini { return (ok); }
