@@ -32,7 +32,8 @@ sub generate_error_page {
   <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">
   <title>"} + resp.status + " " + resp.reason + {"</title>
   <style>
-    body { font-family: -apple-system, system-ui, BlinkMacSystemFont, \"Segoe UI\", Roboto, \"Helvetica Neue\", sans-serif; line-height: 1.5; padding: 2rem; max-width: 45rem; margin: 0 auto; color: #333; }
+    body { font-family: -apple-system, system-ui, BlinkMacSystemFont, \"Segoe UI\", Roboto, \"Helvetica Neue\", sans-serif;
+           line-height: 1.5; padding: 2rem; max-width: 45rem; margin: 0 auto; color: #333; }
     h1 { color: #e53e3e; margin-bottom: 1rem; }
     hr { border: 0; border-top: 1px solid #eee; margin: 2rem 0; }
     .error-code { color: #718096; font-size: 0.875rem; }
@@ -82,7 +83,7 @@ backend default {
 sub vcl_init {
     new cluster = directors.round_robin();
     cluster.add_backend(default);
-    /* Optionally load extra runtime files (e.g. blacklists, device detection) */
+    /* Optionally load extra runtime files (e.g., blacklist, device detection) */
     new blacklist = std.file("/etc/varnish/blacklist.vcl", "text");
     new device_detect = std.file("/etc/varnish/device_detect.vcl", "text");
     return (ok);
@@ -134,10 +135,23 @@ sub vcl_recv {
     if (req.url ~ "^/\\.well-known/acme-challenge/") {
         return (pass);
     }
-
+    
+    ############## Remove Vulnerable Headers ##############
+    unset req.http.proxy;  // Mitigate HTTPoxy
+    
+    ############## Set Real IP (for CloudFlare etc.) ##############
+    if (req.http.X-Forwarded-For) {
+        set req.http.X-Actual-IP = regsub(req.http.X-Forwarded-For, "[, ].*$", "");
+    }
+    
+    ############## Smart Refresh: Force Miss on No‑Cache ##############
+    if (req.http.Cache-Control ~ "no-cache" && client.ip ~ purge) {
+        set req.hash_always_miss = true;
+    }
+    
     ############## URL & Header Normalization ##############
     std.collect(req.http.Cookie);
-    if (req.url ~ "#") {
+    if (req.url ~ "#") { 
         set req.url = regsub(req.url, "#.*", "");
     }
     if (req.url ~ "\?$") {
@@ -147,7 +161,7 @@ sub vcl_recv {
         set req.http.Host = regsub(req.http.Host, ":[0-9]+", "");
     }
     set req.url = std.querysort(req.url);
-    /* Remove tracking parameters (e.g. fbclid, gclid, utm_*, etc.) */
+    /* Remove tracking parameters (e.g., fbclid, gclid, utm_*, etc.) */
     if (req.url ~ "(\?|&)(_bta_[a-z]+|cof|cx|fbclid|gclid|ie|mc_[a-z]+|origin|siteurl|utm_[a-z]+|zanpid)=") {
          set req.url = regsuball(req.url, "(_bta_[a-z]+|cof|cx|fbclid|gclid|ie|mc_[a-z]+|origin|siteurl|utm_[a-z]+|zanpid)=[-_A-Za-z0-9+()%.]+&?", "");
          set req.url = regsub(req.url, "[?|&]+$", "");
@@ -156,7 +170,15 @@ sub vcl_recv {
         return (pass);
     }
     
-    ############## PIPE Non‑Standard Methods ##############
+    ############## Bypass RSS Feed & Search Requests ##############
+    if (req.url ~ "/feed/") {
+        return (pass);
+    }
+    if (req.url ~ "\?s=") {
+        return (pass);
+    }
+    
+    ############## PIPE All Non‑Standard Methods ##############
     if (req.method != "GET" &&
         req.method != "HEAD" &&
         req.method != "PUT" &&
@@ -187,7 +209,7 @@ sub vcl_recv {
         return (pass);
     }
     
-    ############## Accept-Encoding Adjustment ##############
+    ############## Accept-Encoding Adjustment (Gzip/Deflate) ##############
     if (req.http.Accept-Encoding) {
         if (req.url ~ "\.(jpg|jpeg|png|gif|gz|tgz|bz2|tbz|mp3|mp4|ogg)$") {
             unset req.http.Accept-Encoding;
@@ -200,17 +222,17 @@ sub vcl_recv {
         }
     }
     
-    ############## CMS & WooCommerce Dynamic Content Optimizations ##############
+    ############## WooCommerce / WordPress Dynamic Content ##############
     if (req.method == "GET" &&
         (req.url ~ "^/(shop|product|category|tag|archive|blog|page|search|wp-json|feed)") &&
         req.url !~ "\?add-to-cart=" &&
         req.url !~ "wc-ajax|get_refreshed_fragments" &&
         req.url !~ "(cart|checkout|my-account|wc-api|resetpass|wp-admin|xmlrpc.php|customer-area|addons)") {
-        /* Bypass caching for a user‑specific REST endpoint */
+        /* Bypass caching for user‑specific REST endpoints */
         if (req.url ~ "^/wp-json/wp/v2/users/me") {
             return (pass);
         }
-        /* WooCommerce: if a session or cart cookie exists, bypass caching */
+        /* Bypass caching if WooCommerce session/cart cookies exist */
         if (req.http.Cookie ~ "wp_woocommerce_session" ||
             req.http.Cookie ~ "woocommerce_items_in_cart") {
             return (pass);
