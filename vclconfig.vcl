@@ -554,7 +554,7 @@ sub vcl_pass {
 }
 
 ###############################################################################
-# (Optional) VCL_HIT for Handling Stale Content
+# VCL_HIT for Handling Stale Content
 ###############################################################################
 sub vcl_hit {
     if (obj.ttl >= 0s) {
