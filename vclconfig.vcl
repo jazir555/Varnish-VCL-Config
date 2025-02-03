@@ -27,24 +27,24 @@ sub generate_error_page {
     set resp.http.Content-Type = "text/html; charset=utf-8";
     synthetic ({"<!DOCTYPE html>
 <html lang=\"en\">
-<head>
-  <meta charset=\"utf-8\">
-  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">
-  <title>"} + resp.status + " " + resp.reason + {"</title>
-  <style>
-    body { font-family: -apple-system, system-ui, BlinkMacSystemFont, \"Segoe UI\", Roboto, \"Helvetica Neue\", sans-serif;
-           line-height: 1.5; padding: 2rem; max-width: 45rem; margin: 0 auto; color: #333; }
-    h1 { color: #e53e3e; margin-bottom: 1rem; }
-    hr { border: 0; border-top: 1px solid #eee; margin: 2rem 0; }
-    .error-code { color: #718096; font-size: 0.875rem; }
-  </style>
-</head>
-<body>
-  <h1>Error "} + resp.status + {"</h1>
-  <p>"} + resp.reason + {"</p>
-  <hr>
-  <p class=\"error-code\">Error Code: "} + resp.status + {"</p>
-</body>
+  <head>
+    <meta charset=\"utf-8\">
+    <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">
+    <title>"} + resp.status + " " + resp.reason + {"</title>
+    <style>
+      body { font-family: -apple-system, system-ui, BlinkMacSystemFont, \"Segoe UI\", Roboto, \"Helvetica Neue\", sans-serif;
+             line-height: 1.5; padding: 2rem; max-width: 45rem; margin: 0 auto; color: #333; }
+      h1 { color: #e53e3e; margin-bottom: 1rem; }
+      hr { border: 0; border-top: 1px solid #eee; margin: 2rem 0; }
+      .error-code { color: #718096; font-size: 0.875rem; }
+    </style>
+  </head>
+  <body>
+    <h1>Error "} + resp.status + {"</h1>
+    <p>"} + resp.reason + {"</p>
+    <hr>
+    <p class=\"error-code\">Error Code: "} + resp.status + {"</p>
+  </body>
 </html>
 "});
 }
@@ -108,7 +108,7 @@ sub vcl_hash {
     } else {
         hash_data(server.ip);
     }
-    /* Canonicalize URL by stripping any query string */
+    /* Use a canonical URL (strip query string) for caching */
     set req.http.ccsuri = regsub(req.url, "\?.*$", "");
     hash_data(req.http.ccsuri);
     if (req.http.X-Logged-In) {
@@ -137,9 +137,9 @@ sub vcl_recv {
     }
     
     ############## Remove Vulnerable Headers ##############
-    unset req.http.proxy;  // Mitigate HTTPoxy
-    
-    ############## Set Real IP (for CloudFlare etc.) ##############
+    unset req.http.proxy;  // Mitigate HTTPoxy vulnerability
+
+    ############## Set Real Client IP (e.g., behind CloudFlare) ##############
     if (req.http.X-Forwarded-For) {
         set req.http.X-Actual-IP = regsub(req.http.X-Forwarded-For, "[, ].*$", "");
     }
@@ -151,7 +151,7 @@ sub vcl_recv {
     
     ############## URL & Header Normalization ##############
     std.collect(req.http.Cookie);
-    if (req.url ~ "#") { 
+    if (req.url ~ "#") {
         set req.url = regsub(req.url, "#.*", "");
     }
     if (req.url ~ "\?$") {
@@ -170,15 +170,11 @@ sub vcl_recv {
         return (pass);
     }
     
-    ############## Bypass RSS Feed & Search Requests ##############
-    if (req.url ~ "/feed/") {
-        return (pass);
-    }
-    if (req.url ~ "\?s=") {
-        return (pass);
-    }
+    ############## Bypass RSS and Search Requests ##############
+    if (req.url ~ "/feed/") { return (pass); }
+    if (req.url ~ "\?s=")   { return (pass); }
     
-    ############## PIPE All Non‑Standard Methods ##############
+    ############## PIPE Non‑Standard Methods ##############
     if (req.method != "GET" &&
         req.method != "HEAD" &&
         req.method != "PUT" &&
@@ -204,12 +200,12 @@ sub vcl_recv {
         unset req.http.Cookie;
     }
     
-    ############## BASIC AUTH / Cookie Check – Do Not Cache if Present ##############
+    ############## BASIC AUTH / Cookie Check ##############
     if (req.http.Authorization || req.http.Cookie) {
         return (pass);
     }
     
-    ############## Accept-Encoding Adjustment (Gzip/Deflate) ##############
+    ############## Accept-Encoding Adjustment ##############
     if (req.http.Accept-Encoding) {
         if (req.url ~ "\.(jpg|jpeg|png|gif|gz|tgz|bz2|tbz|mp3|mp4|ogg)$") {
             unset req.http.Accept-Encoding;
@@ -222,7 +218,7 @@ sub vcl_recv {
         }
     }
     
-    ############## WooCommerce / WordPress Dynamic Content ##############
+    ############## Dynamic Content (WordPress/WooCommerce) ##############
     if (req.method == "GET" &&
         (req.url ~ "^/(shop|product|category|tag|archive|blog|page|search|wp-json|feed)") &&
         req.url !~ "\?add-to-cart=" &&
@@ -232,7 +228,7 @@ sub vcl_recv {
         if (req.url ~ "^/wp-json/wp/v2/users/me") {
             return (pass);
         }
-        /* Bypass caching if WooCommerce session/cart cookies exist */
+        /* Bypass caching if WooCommerce session or cart cookies exist */
         if (req.http.Cookie ~ "wp_woocommerce_session" ||
             req.http.Cookie ~ "woocommerce_items_in_cart") {
             return (pass);
@@ -264,7 +260,7 @@ sub vcl_recv {
     }
     
     ############## Cookie & Tracking Cleanup ##############
-    set req.http.Cookie = regsuball(req.http.Cookie, "(^|;\\s*)(__[a-z]+|has_js)=[^;]*", "");
+    set req.http.Cookie = regsuball(req.http.Cookie, "has_js=[^;]+(; )?", "");
     set req.http.Cookie = regsuball(req.http.Cookie, "__utm\\w+=[^;]+(; )?", "");
     set req.http.Cookie = regsuball(req.http.Cookie, "_ga=[^;]+(; )?", "");
     set req.http.Cookie = regsuball(req.http.Cookie, "_gat=[^;]+(; )?", "");
@@ -451,7 +447,7 @@ sub vcl_backend_response {
         set beresp.ttl = 7d;
         set beresp.http.Cache-Control = "public, max-age=604800";
         set beresp.http.Vary = "Accept-Encoding";
-        unset beresp.http.Set-Cookie;
+        unset beresp.http.Set-Cookie;  // Avoid caching cookies!
     } else {
         if (!(bereq.url ~ "(?i)wp-(login|admin)|cart|checkout|my-account|wc-api|resetpass") &&
             !beresp.http.Set-Cookie) {
@@ -492,7 +488,7 @@ sub vcl_backend_response {
         set beresp.do_gzip = false;
     } else {
         set beresp.do_gzip = true;
-        set beresp.http.X-Cache = "ZIP";
+        set beresp.http.X-Cache = "ZIP";  // Tag gzip responses for debugging
     }
     if (beresp.http.content-type ~ "text") {
         set beresp.do_gzip = true;
@@ -620,7 +616,7 @@ sub vcl_hit {
 }
 
 ###############################################################################
-# (Optional) VCL_BACKEND_ERROR for Serving a Custom Error Page if Backend is Down
+# (Optional) VCL_BACKEND_ERROR for Custom Error Page if Backend is Down
 ###############################################################################
 sub vcl_backend_error {
     if (beresp.status == 503 && bereq.retries == 3) {
