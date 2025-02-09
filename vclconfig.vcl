@@ -218,6 +218,12 @@ sub vcl_recv {
         if (req.url ~ "^/wp-json/wp/v2/users/me") {
             return (pass);
         }
+        if (req.http.Cookie ~ "wp_woocommerce_session" ||
+            req.http.Cookie ~ "woocommerce_items_in_cart" ||
+            req.http.Cookie ~ "woocommerce_cart_hash") {
+            return (pass);
+        }
+
         if (req.http.Cookie ~ "wordpress_logged_in") {
             if (req.http.Cookie ~ "user_roles=") {
                 set req.http.X-User-Roles = regsub(req.http.Cookie, "^.*?user_roles=([^;]+);*.*$", "\1");
