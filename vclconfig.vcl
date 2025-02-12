@@ -219,6 +219,42 @@ sub clean_query_parameters {
 }
 
 # ------------------------------------------------------------------------------
+# NEW FEATURE:
+# Remove non-essential WordPress cookies that do not affect front-end rendering.
+# (For example, wp-settings*, wp-test*, etc.)
+# This allows static/dynamic pages to be cached for non-logged in users
+# while retaining important session info for actual logged-in or cart usage.
+# ------------------------------------------------------------------------------
+sub remove_unnecessary_wp_cookies {
+    if (req.http.Cookie) {
+        # Only remove these cookies if the user is not recognized as "logged in".
+        if (!is_logged_in()) {
+            # Common WordPress settings cookies that don't affect page content
+            set req.http.Cookie = regsuball(
+                req.http.Cookie,
+                "(^|; )wp-settings-[^=]*=[^;]+(; |$)",
+                "\1"
+            );
+            set req.http.Cookie = regsuball(
+                req.http.Cookie,
+                "(^|; )wp-settings-time-[^=]*=[^;]+(; |$)",
+                "\1"
+            );
+            set req.http.Cookie = regsuball(
+                req.http.Cookie,
+                "(^|; )wordpress_test_cookie=[^;]+(; |$)",
+                "\1"
+            );
+
+            # If the cookie header is now empty or only spaces, unset it
+            if (req.http.Cookie ~ "^\s*$") {
+                unset req.http.Cookie;
+            }
+        }
+    }
+}
+
+# ------------------------------------------------------------------------------
 # vcl_hash
 # ------------------------------------------------------------------------------
 sub vcl_hash {
@@ -343,6 +379,11 @@ sub vcl_recv {
         return (pass);
     }
 
+    # NEW FEATURE:
+    # Remove non-critical WP cookies that do not affect final HTML for
+    # non-logged-in users
+    call remove_unnecessary_wp_cookies;
+
     # 12) Static file handling
     if (req.url ~ "(?i)\.(7z|avi|bmp|bz2|css|csv|doc|docx|eot|flac|flv|gif|gz|ico|jpe?g|js|less|mka|mkv|mov|mp3|mp4|mpeg|mpg|odt|otf|ogg|ogm|opus|pdf|png|ppt|pptx|rar|rtf|svgz?|swf|tar|tbz|tgz|ttf|txt|txz|wav|web[mp]|woff2?|xlsx|xml|xz|zip)(\?.*)?$") {
         unset req.http.Cookie;
@@ -381,12 +422,20 @@ sub vcl_backend_response {
         }
     }
 
+    # NEW FEATURE:
+    # If the origin sets X-Purge-Keys, we attach them as xkey for advanced
+    # surrogate key purging.
+    if (beresp.http.X-Purge-Keys) {
+        xkey.add(beresp.http.X-Purge-Keys);
+    }
+
     # 3) Static asset caching
     if (bereq.http.X-Static == "1" || bereq.url ~ "\.(?i)(css|js|jpg|jpeg|png|gif|ico|woff2)$") {
         set beresp.ttl        = 365d;
         set beresp.grace      = 7d;
         set beresp.keep       = 7d;
-        set beresp.http.Cache-Control = "public, max-age=31536000, immutable";
+        # IMPROVEMENT: add stale-while-revalidate/stale-if-error
+        set beresp.http.Cache-Control = "public, max-age=31536000, immutable, stale-while-revalidate=86400, stale-if-error=86400";
         set beresp.http.Vary  = "Accept-Encoding";
 
         # Stream large files
@@ -409,7 +458,8 @@ sub vcl_backend_response {
             set beresp.ttl   = 4h;
             set beresp.grace = 24h;
             set beresp.keep  = 24h;
-            set beresp.http.Cache-Control = "public, max-age=14400";
+            # IMPROVEMENT: add stale-while-revalidate, stale-if-error
+            set beresp.http.Cache-Control = "public, max-age=14400, stale-while-revalidate=3600, stale-if-error=43200";
         }
     }
 
