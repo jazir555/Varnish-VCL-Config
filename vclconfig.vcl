@@ -9,22 +9,27 @@ import tcp;
 import shard;
 import blob;
 import unix;
-import xkey;      # New for selective purging
-import bodyaccess; # New for response body manipulation
-import cookie;    # New for advanced cookie handling
-import vtc;       # New for testing support
+import xkey;         # For selective purging
+import bodyaccess;   # For response body manipulation
+import cookie;       # Advanced cookie handling
+import vtc;          # Varnish testing framework (if needed for local testing)
 
-# Memory management tuning
-# -p workspace_client=256k
-# -p workspace_backend=256k
-# -p thread_pool_min=200
-# -p thread_pool_max=4000
-# -p thread_pool_timeout=300
-# -p thread_pools=2
-# -p pcre_match_limit=10000
-# -p pcre_match_limit_recursion=10000
+#------------------------------------------------------------------------------
+# Memory management & threading
+#------------------------------------------------------------------------------
+# You can set these parameters outside the VCL or as runtime parameters, e.g.:
+# varnishd -p workspace_client=256k \
+#           -p workspace_backend=256k \
+#           -p thread_pool_min=200 \
+#           -p thread_pool_max=4000 \
+#           -p thread_pool_timeout=300 \
+#           -p thread_pools=2 \
+#           -p pcre_match_limit=10000 \
+#           -p pcre_match_limit_recursion=10000
 
-# Optimized ACLs with specific CIDR ranges
+#------------------------------------------------------------------------------
+# ACLs
+#------------------------------------------------------------------------------
 acl purge {
     "localhost";
     "127.0.0.1"/8;
@@ -41,13 +46,15 @@ acl trusted_networks {
     "fe80::"/10;
 }
 
-# Multi-layer health checks
+#------------------------------------------------------------------------------
+# Health Checks
+#------------------------------------------------------------------------------
 probe tcp_probe {
-    .window = 10;
-    .initial = 4;
+    .window   = 10;
+    .initial  = 4;
     .threshold = 6;
     .interval = 2s;
-    .timeout = 1s;
+    .timeout  = 1s;
 }
 
 probe backend_probe {
@@ -57,102 +64,138 @@ probe backend_probe {
         "Connection: close"
         "User-Agent: Varnish Health Probe";
     .interval = 2s;
-    .timeout = 1s;
-    .window = 10;
+    .timeout  = 1s;
+    .window   = 10;
     .threshold = 6;
-    .initial = 4;
+    .initial   = 4;
     .expected_response = 200;
-    .match_pattern = "OK";
-    .threshold = 3;
+    .match_pattern     = "OK";
+    .threshold         = 3;
 }
 
-# Advanced backend configuration
+#------------------------------------------------------------------------------
+# Backend Configuration
+#------------------------------------------------------------------------------
 backend default {
     .host = "192.168.1.50";
     .port = "8080";
-    .first_byte_timeout = 60s;      # Reduced for faster failing
-    .between_bytes_timeout = 15s;    # Reduced for better responsiveness
-    .max_connections = 1000;         # Increased for higher concurrency
-    .probe = backend_probe;
+    .first_byte_timeout     = 60s;
+    .between_bytes_timeout  = 15s;
+    .max_connections        = 1000;
+    .probe                  = backend_probe;
     
     # Optimized TCP settings
-    .tcp_keepalive_time = 180;      # Reduced for faster connection reuse
-    .tcp_keepalive_probes = 4;
+    .tcp_keepalive_time  = 180;
+    .tcp_keepalive_probes= 4;
     .tcp_keepalive_intvl = 20;
-    .connect_timeout = 1s;          # Quick fail for connection issues
+    .connect_timeout     = 1s;
     
-    # Advanced connection pooling
-    .min_pool_size = 50;           # Minimum idle connections
-    .max_pool_size = 500;          # Maximum connection pool size
-    .pool_timeout = 30s;           # Connection pool timeout
+    # Connection pooling
+    .min_pool_size = 50;
+    .max_pool_size = 500;
+    .pool_timeout  = 30s;
 }
 
-# Initialization with advanced director setup
+#------------------------------------------------------------------------------
+# Advanced Directors / Pools
+#------------------------------------------------------------------------------
 sub vcl_init {
-    # Advanced sharding with warmup
+    # Sharding with warmup
     new cluster = shard.director(
         {
-            .backend = default;
-            .by_hash = true;           # Use consistent hashing
-            .warmup = 15s;             # Warmup period
-            .rampup = 45s;             # Ramp-up period
-            .retries = 5;              # Number of retries
-            .skip_gone = true;         # Skip unavailable backends
-            .healthy_threshold = 2;     # Number of healthy probes
+            .backend        = default;
+            .by_hash        = true;
+            .warmup         = 15s;
+            .rampup         = 45s;
+            .retries        = 5;
+            .skip_gone      = true;
+            .healthy_threshold = 2;
         }
     );
-    
+
     # Progressive rate limiting
     new throttle = vsthrottle.rate_limit(
-        .max_rate = 250,              # Increased base rate
-        .duration = 60,
-        .burst = 75,                  # Increased burst allowance
-        .penalty_box = 300            # Time in penalty box
+        .max_rate    = 250,   # Increased rate
+        .duration    = 60,
+        .burst       = 75,    # Increased burst
+        .penalty_box = 300
     );
-    
+
     # Optimized TCP pool
     new pool = tcp.pool(
-        .max_connections = 2500,      # Increased max connections
-        .min_connections = 200,       # Increased min connections
-        .idle_timeout = 180,          # Reduced idle timeout
-        .connect_timeout = 0.5        # Quick connection timeout
+        .max_connections = 2500,
+        .min_connections = 200,
+        .idle_timeout    = 180,
+        .connect_timeout = 0.5
     );
-    
+
     return (ok);
 }
 
-# Optimized hash function
+#------------------------------------------------------------------------------
+# vcl_hash
+#------------------------------------------------------------------------------
 sub vcl_hash {
-    # Efficient composite key hashing
+    # Composite hashing (URL + Host + Device)
     hash_data(blob.encode(req.url + req.http.host + req.http.X-Device-Type, blob.BASE64));
-    
+
     if (req.http.X-Forwarded-Proto) {
         hash_data(req.http.X-Forwarded-Proto);
     }
-    
-    # User-specific caching
+
+    # If there's a user ID header, incorporate for user-specific caching
     if (req.http.X-User-ID) {
         hash_data(req.http.X-User-ID);
     }
-    
+
     return (lookup);
 }
 
-# Advanced hit-for-pass object handling
+#------------------------------------------------------------------------------
+# vcl_hit
+#------------------------------------------------------------------------------
 sub vcl_hit {
     if (obj.ttl >= 0s) {
         return (deliver);
     }
-    
     if (obj.ttl + obj.grace > 0s) {
         return (deliver);
     }
-    
     return (miss);
 }
 
+#------------------------------------------------------------------------------
+# Helper Routines / WP + WooCommerce detection
+#------------------------------------------------------------------------------
+sub is_logged_in {
+    # Detect typical WordPress/WooCommerce logged-in cookies
+    if (req.http.Cookie) {
+        if (
+            req.http.Cookie ~ "wordpress_logged_in" ||
+            req.http.Cookie ~ "wordpress_sec_" ||
+            req.http.Cookie ~ "wp_woocommerce_session" ||
+            req.http.Cookie ~ "woocommerce_items_in_cart" ||
+            req.http.Cookie ~ "woocommerce_cart_hash"
+        ) {
+            return(true);
+        }
+    }
+    return(false);
+}
+
+sub is_admin_area {
+    # Typical WordPress admin URLs
+    if (req.url ~ "(wp-admin|wp-login\.php)") {
+        return(true);
+    }
+    return(false);
+}
+
+#------------------------------------------------------------------------------
+# vcl_recv
+#------------------------------------------------------------------------------
 sub vcl_recv {
-    # Optimized TCP handling
+    # Optimize TCP handling for idle sockets
     if (tcp.is_idle(client.socket)) {
         if (req.url ~ "\.(mp4|mkv|iso)$") {
             tcp.set_socket_pace(client.socket, 2MB);
@@ -161,16 +204,16 @@ sub vcl_recv {
         }
     }
 
-    # Request normalization
+    # Normalize host and sort query parameters
     set req.http.Host = regsub(req.http.Host, ":[0-9]+", "");
     set req.url = std.querysort(req.url);
-    
-    # Efficient URL cleaning
+
+    # Remove URL fragments (#, trailing ?)
     if (req.url ~ "[#\?]") {
         set req.url = chunk.replace(req.url, "[#\?].*$", "");
     }
 
-    # Device detection for caching
+    # Device detection
     if (req.http.User-Agent) {
         if (req.http.User-Agent ~ "(?i)mobile|android|iphone|ipod|tablet") {
             set req.http.X-Device-Type = "mobile";
@@ -179,13 +222,13 @@ sub vcl_recv {
         }
     }
 
-    # Advanced parameter cleaning
+    # Advanced parameter cleaning (UTM, ref, etc.)
     if (req.url ~ "[?&](utm_|fbclid|gclid|fb_|ga_|_ga|_gl|ref_|source_|campaign_|medium_|term_)") {
         set req.url = chunk.replace(req.url, "(utm_|fbclid|gclid|fb_|ga_|_ga|_gl|ref_|source_|campaign_|medium_|term_)[^&]+&?", "");
         set req.url = chunk.replace(req.url, "(\?|&)$", "");
     }
 
-    # Selective purging with xkey
+    # Selective PURGE via xkey
     if (req.method == "PURGE") {
         if (!client.ip ~ purge) {
             return (synth(405, "Not allowed"));
@@ -202,7 +245,7 @@ sub vcl_recv {
     # Enhanced bot handling
     if (req.http.User-Agent ~ "(?i)(bot|crawl|slurp|spider)") {
         if (req.http.User-Agent !~ "(?i)(googlebot|bingbot|yandex|baiduspider)") {
-            # Advanced bot verification
+            # Advanced bot DNS check
             if (!std.dns("txt", regsub(client.ip, "^([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)$", "\4.\3.\2.\1.in-addr.arpa"))) {
                 if (vsthrottle.is_denied("bot:" + client.ip, 50, 60s)) {
                     unix.syslog(unix.LOG_WARNING, "Bot banned: " + client.ip);
@@ -221,6 +264,27 @@ sub vcl_recv {
         return (synth(429, "Rate Limited"));
     }
 
+    # Handle WooCommerce & WordPress
+    # --------------------------------------------------------------------------
+    # 1) If user is requesting wp-admin, wp-login.php, or a logged-in user cookie,
+    #    we do not cache. This ensures correct dynamic behavior.
+    # 2) If request is for WooCommerce cart, checkout, or has cart fragments,
+    #    we also pass.
+    if (is_admin_area() || is_logged_in()) {
+        return (pass);
+    }
+    
+    # If it's a WC Ajax endpoint (e.g., ?wc-ajax=...),
+    # pass to avoid caching dynamic cart data.
+    if (req.url ~ "wc-ajax=") {
+        return(pass);
+    }
+
+    # Bypass caching for POST or other non-idempotent methods (just in case)
+    if (req.method != "GET" && req.method != "HEAD") {
+        return (pass);
+    }
+
     # Smart static file handling
     if (req.url ~ "(?i)\.(7z|avi|bmp|bz2|css|csv|doc|docx|eot|flac|flv|gif|gz|ico|jpe?g|js|less|mka|mkv|mov|mp3|mp4|mpeg|mpg|odt|otf|ogg|ogm|opus|pdf|png|ppt|pptx|rar|rtf|svgz?|swf|tar|tbz|tgz|ttf|txt|txz|wav|web[mp]|woff2?|xlsx|xml|xz|zip)(\?.*)?$") {
         unset req.http.Cookie;
@@ -234,10 +298,15 @@ sub vcl_recv {
     } else {
         set req.grace = 24h;
     }
+
+    return (hash);
 }
 
+#------------------------------------------------------------------------------
+# vcl_backend_response
+#------------------------------------------------------------------------------
 sub vcl_backend_response {
-    # Advanced ESI handling
+    # Advanced ESI detection
     if (beresp.http.Surrogate-Control ~ "ESI/1.0") {
         unset beresp.http.Surrogate-Control;
         set beresp.do_esi = true;
@@ -249,36 +318,36 @@ sub vcl_backend_response {
 
     # Intelligent static asset handling
     if (bereq.url ~ "\.(?i)(css|js|jpg|jpeg|png|gif|ico|woff2)$") {
-        set beresp.ttl = 365d;
-        set beresp.grace = 7d;
+        set beresp.ttl  = 365d;
+        set beresp.grace= 7d;
         set beresp.keep = 7d;
         set beresp.http.Cache-Control = "public, max-age=31536000, immutable";
         set beresp.http.Vary = "Accept-Encoding";
-        
+
         # Streaming for large files
         if (std.integer(beresp.http.Content-Length, 0) > 5242880) {
             set beresp.do_stream = true;
             set beresp.http.X-Stream = "true";
         }
-        
-        # Compression optimization
-        if (beresp.http.content-type ~ "text" || 
+
+        # Compression for text-like assets
+        if (beresp.http.content-type ~ "text" ||
             beresp.http.content-type ~ "application/(javascript|json|xml)") {
             if (std.integer(beresp.http.Content-Length, 0) > 860) {
                 set beresp.do_gzip = true;
             }
         }
     } else {
-        # Dynamic content handling
+        # Default dynamic content TTL
         if (!beresp.http.Cache-Control) {
-            set beresp.ttl = 4h;
-            set beresp.grace = 24h;
+            set beresp.ttl  = 4h;
+            set beresp.grace= 24h;
             set beresp.keep = 24h;
             set beresp.http.Cache-Control = "public, max-age=14400";
         }
     }
 
-    # Error handling
+    # Handle server errors
     if (beresp.status >= 500) {
         set beresp.ttl = 1s;
         set beresp.grace = 5s;
@@ -286,14 +355,15 @@ sub vcl_backend_response {
     }
 
     # Body compression optimization
-    if (beresp.http.content-type ~ "text" || 
+    if (beresp.http.content-type ~ "text" ||
         beresp.http.content-type ~ "application/json" ||
         beresp.http.content-type ~ "application/javascript") {
-        
+
         if (std.integer(beresp.http.Content-Length, 0) < 860) {
             set beresp.do_gzip = false;
         } else {
             set beresp.do_gzip = true;
+            # Stream large responses
             if (std.integer(beresp.http.Content-Length, 0) > 102400) {
                 set beresp.do_stream = true;
             }
@@ -301,20 +371,24 @@ sub vcl_backend_response {
     }
 }
 
+#------------------------------------------------------------------------------
+# vcl_deliver
+#------------------------------------------------------------------------------
 sub vcl_deliver {
-    # Performance headers cleanup
+    # Remove sensitive headers
     unset resp.http.Server;
     unset resp.http.X-Powered-By;
     unset resp.http.X-Varnish;
     unset resp.http.Via;
-    
+
     # Debug info for trusted networks
     if (client.ip ~ trusted_networks) {
-        set resp.http.X-Cache = obj.hits > 0 ? "HIT" : "MISS";
-        set resp.http.X-Cache-Hits = obj.hits;
-        set resp.http.X-Served-By = server.hostname;
-        set resp.http.X-Pool = req.backend_hint;
-        set resp.http.X-Grace = req.grace;
+        set resp.http.X-Cache       = (obj.hits > 0) ? "HIT" : "MISS";
+        set resp.http.X-Cache-Hits  = obj.hits;
+        set resp.http.X-Served-By   = server.hostname;
+        set resp.http.X-Pool        = req.backend_hint;
+        set resp.http.X-Grace       = req.grace;
+
         if (resp.http.X-Stream) {
             set resp.http.X-Stream-Size = beresp.http.Content-Length;
         }
@@ -324,6 +398,9 @@ sub vcl_deliver {
     }
 }
 
+#------------------------------------------------------------------------------
+# vcl_synth
+#------------------------------------------------------------------------------
 sub vcl_synth {
     if (resp.status == 750) {
         set resp.status = 301;
@@ -331,12 +408,21 @@ sub vcl_synth {
         return (deliver);
     }
 
+    # Rate Limit / 429
     if (resp.status == 429) {
-        set resp.http.Retry-After = "60";
+        set resp.http.Retry-After       = "60";
         set resp.http.X-RateLimit-Reset = std.time(now + 60s, "%s");
         set resp.http.X-RateLimit-Limit = "250";
     }
 
     call generate_error_page;
     return (deliver);
+}
+
+#------------------------------------------------------------------------------
+# Optional: Custom Error Page Generator
+#------------------------------------------------------------------------------
+sub generate_error_page {
+    # If you have a custom error page generation, put it here.
+    # Otherwise, it can remain empty or minimal.
 }
