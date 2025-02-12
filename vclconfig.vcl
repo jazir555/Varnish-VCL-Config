@@ -13,23 +13,27 @@ import xkey;
 import bodyaccess;
 import cookie;
 import header;
-import vtc;  # Optional: for local testing
+import vtc;  # Optional for local testing or advanced Varnish testcases
 
 # ------------------------------------------------------------------------------
-# Runtime Parameter Suggestions (set outside this VCL):
-# varnishd -p workspace_client=256k \
-#           -p workspace_backend=256k \
-#           -p thread_pool_min=200 \
-#           -p thread_pool_max=4000 \
-#           -p thread_pool_timeout=300 \
-#           -p thread_pools=2 \
-#           -p pcre_match_limit=10000 \
-#           -p pcre_match_limit_recursion=10000
-# Tweak these for your hardware/traffic for best performance.
+# Suggested varnishd runtime parameters (adjust to taste):
+# varnishd \
+#   -p workspace_client=256k \
+#   -p workspace_backend=256k \
+#   -p thread_pool_min=200 \
+#   -p thread_pool_max=4000 \
+#   -p thread_pool_timeout=300 \
+#   -p thread_pools=2 \
+#   -p pcre_match_limit=10000 \
+#   -p pcre_match_limit_recursion=10000 \
+#   -p http_resp_size=64k \
+#   -p http_req_size=64k
+#
+# You can further tune these depending on your concurrency & memory resources.
 # ------------------------------------------------------------------------------
 
 # ------------------------------------------------------------------------------
-# Access Control Lists
+# ACLs
 # ------------------------------------------------------------------------------
 acl purge {
     "localhost";
@@ -51,11 +55,11 @@ acl trusted_networks {
 # Health Checks
 # ------------------------------------------------------------------------------
 probe tcp_probe {
-    .window    = 10;
-    .initial   = 4;
-    .threshold = 6;
-    .interval  = 2s;
-    .timeout   = 1s;
+    .window     = 10;
+    .initial    = 4;
+    .threshold  = 6;
+    .interval   = 2s;
+    .timeout    = 1s;
 }
 
 probe backend_probe {
@@ -64,34 +68,34 @@ probe backend_probe {
         "Host: _health"
         "Connection: close"
         "User-Agent: Varnish Health Probe";
-    .interval         = 2s;
-    .timeout          = 1s;
-    .window           = 10;
-    .threshold        = 6;
-    .initial          = 4;
-    .expected_response= 200;
-    .match_pattern    = "OK";
-    .threshold        = 3;
+    .interval          = 2s;
+    .timeout           = 1s;
+    .window            = 10;
+    .threshold         = 6;
+    .initial           = 4;
+    .expected_response = 200;
+    .match_pattern     = "OK";
+    .threshold         = 3;
 }
 
 # ------------------------------------------------------------------------------
 # Backend Configuration
 # ------------------------------------------------------------------------------
 backend default {
-    .host = "192.168.1.50";      # <-- Adjust to your backend IP or hostname
-    .port = "8080";              # <-- Adjust as needed
+    .host = "192.168.1.50";      # Adjust to your environment
+    .port = "8080";
     .first_byte_timeout     = 60s;
     .between_bytes_timeout  = 15s;
     .max_connections        = 1000;
     .probe                  = backend_probe;
 
     # Optimized TCP settings
-    .tcp_keepalive_time  = 180;
-    .tcp_keepalive_probes= 4;
-    .tcp_keepalive_intvl = 20;
-    .connect_timeout     = 1s;
+    .tcp_keepalive_time   = 180;
+    .tcp_keepalive_probes = 4;
+    .tcp_keepalive_intvl  = 20;
+    .connect_timeout      = 1s;
 
-    # Connection pooling (for reuse)
+    # Connection pooling
     .min_pool_size = 50;
     .max_pool_size = 500;
     .pool_timeout  = 30s;
@@ -101,14 +105,10 @@ backend default {
 # Directors / Pools / Rate Limiting
 # ------------------------------------------------------------------------------
 sub vcl_init {
-    # --------------------------------------------------------------------------
-    # 1) Sharding Director
-    # If you have multiple backends, define them separately and load-balance.
-    # By default, we set up a single "default" backend. 
-    # --------------------------------------------------------------------------
+    # Sharding Director (supports advanced load balancing)
     new cluster = shard.director({
         .backend           = default;
-        .by_hash           = true;      # consistent hashing
+        .by_hash           = true;  # consistent hashing
         .warmup            = 15s;
         .rampup            = 45s;
         .retries           = 5;
@@ -116,22 +116,15 @@ sub vcl_init {
         .healthy_threshold = 2;
     });
 
-    # --------------------------------------------------------------------------
-    # 2) Progressive rate limiting with vsthrottle
-    # This helps mitigate abusive or high-rate requests.
-    # --------------------------------------------------------------------------
+    # Rate limiting for general traffic
     new throttle = vsthrottle.rate_limit(
         .max_rate    = 250,   # base rate
-        .duration    = 60,    # per 60 seconds
-        .burst       = 75,    # extra burst capacity
-        .penalty_box = 300    # time in penalty box (seconds)
+        .duration    = 60,    # 60s window
+        .burst       = 75,    # extra capacity
+        .penalty_box = 300    # time in penalty box
     );
 
-    # --------------------------------------------------------------------------
-    # 3) TCP Pool
-    # Useful if you have multiple connections to your backend and want 
-    # advanced connection reuse.
-    # --------------------------------------------------------------------------
+    # TCP Pool for advanced connection reuse
     new pool = tcp.pool(
         .max_connections = 2500,
         .min_connections = 200,
@@ -143,8 +136,7 @@ sub vcl_init {
 }
 
 # ------------------------------------------------------------------------------
-# Security Headers
-# Added in vcl_deliver to ensure they apply to all successful or error responses.
+# Security Headers (delivered in vcl_deliver)
 # ------------------------------------------------------------------------------
 sub add_security_headers {
     set resp.http.Strict-Transport-Security = "max-age=31536000; includeSubDomains; preload";
@@ -153,8 +145,7 @@ sub add_security_headers {
     set resp.http.Referrer-Policy           = "strict-origin-when-cross-origin";
     set resp.http.Permissions-Policy        = "interest-cohort=()";
 
-    # Example minimal CSP for HTML/PHP:
-    # Adjust to fit your site’s actual needs for inline JS, fonts, frames, etc.
+    # Minimal default CSP for *.html or *.php
     if (req.url ~ "\.(html|php)$") {
         set resp.http.Content-Security-Policy =
             "default-src 'self' https: 'unsafe-inline' 'unsafe-eval';";
@@ -162,21 +153,20 @@ sub add_security_headers {
 }
 
 # ------------------------------------------------------------------------------
-# Saint Mode for Backend Errors
-# - Tries a re-fetch or to avoid a failing backend for a short time
+# Saint Mode for Backend Errors (improves resilience)
 # ------------------------------------------------------------------------------
 sub vcl_backend_error {
     if (beresp.status >= 500) {
-        std.log("Backend error: saint mode -> " + bereq.url);
+        std.log("Saint mode triggered for: " + bereq.url);
         return (retry);
     }
 }
 
 # ------------------------------------------------------------------------------
-# WP/WooCommerce Helper Routines
+# WordPress / WooCommerce Helper Routines
 # ------------------------------------------------------------------------------
 sub is_logged_in {
-    # Typical WordPress/WooCommerce logged-in cookies
+    # Typical WP/Woo logged-in cookies
     if (req.http.Cookie) {
         if (
             req.http.Cookie ~ "wordpress_logged_in" ||
@@ -192,17 +182,12 @@ sub is_logged_in {
 }
 
 sub is_admin_area {
-    # WordPress admin routes
     if (req.url ~ "(wp-admin|wp-login\.php)") {
         return(true);
     }
     return(false);
 }
 
-# ------------------------------------------------------------------------------
-# Additional WP-related detection
-# (e.g., WP REST API endpoints, if you want to pass them)
-# ------------------------------------------------------------------------------
 sub is_wp_rest_api {
     if (req.url ~ "^/wp-json/") {
         return(true);
@@ -225,11 +210,10 @@ sub detect_device {
 
 # ------------------------------------------------------------------------------
 # Advanced Query Parameter Stripping
-# Removes known marketing/tracking params
 # ------------------------------------------------------------------------------
 sub clean_query_parameters {
+    # Remove marketing/tracking parameters
     set req.url = querystring.regfilter(req.url, "^(utm_|fbclid|gclid|mc_eid|ref|cx|ie|cof|siteurl|zanpid|origin|amp)");
-    # Additional known patterns
     set req.url = regsuball(req.url, "(^|&)(_ga|_ke|mr:[A-Za-z0-9_]+|ncid|platform|spm|sp_|zan-src|mtm|trk|si)=", "&");
     set req.url = regsub(req.url, "(\?|&)+$", "");
 }
@@ -238,15 +222,15 @@ sub clean_query_parameters {
 # vcl_hash
 # ------------------------------------------------------------------------------
 sub vcl_hash {
-    # Use a composite hash: URL + Host + Device type
+    # Combine URL + Host + Device-type for your hash
     hash_data(blob.encode(req.url + req.http.host + req.http.X-Device-Type, blob.BASE64));
 
-    # Distinguish by X-Forwarded-Proto if you vary content by HTTP vs. HTTPS
+    # If you want separate caches for HTTP vs. HTTPS
     if (req.http.X-Forwarded-Proto) {
         hash_data(req.http.X-Forwarded-Proto);
     }
 
-    # Optional per-user cache key
+    # Optional per-user caching (e.g., membership sites)
     if (req.http.X-User-ID) {
         hash_data(req.http.X-User-ID);
     }
@@ -268,10 +252,10 @@ sub vcl_hit {
 }
 
 # ------------------------------------------------------------------------------
-# vcl_recv: Main Entry Point for Requests
+# vcl_recv: Entry Point for Client Requests
 # ------------------------------------------------------------------------------
 sub vcl_recv {
-    # 1) TCP Socket Pacing (large vs. smaller files)
+    # 1) Socket pacing for large vs. smaller content
     if (tcp.is_idle(client.socket)) {
         if (req.url ~ "\.(mp4|mkv|iso)$") {
             tcp.set_socket_pace(client.socket, 5MB);
@@ -280,51 +264,49 @@ sub vcl_recv {
         }
     }
 
-    # 2) Host normalization (remove port)
+    # 2) Normalize host (remove any port suffix)
     set req.http.Host = regsub(req.http.Host, ":[0-9]+", "");
 
-    # 3) Detect device for possible separate caching
+    # 3) Device detection
     call detect_device;
 
-    # 4) Clean query parameters (remove marketing/tracking)
+    # 4) Clean up query parameters
     call clean_query_parameters;
 
-    # 5) Remove fragment (#...) then sort remaining query
+    # 5) Remove URL fragment, sort query
     set req.url = std.querysort(regsub(req.url, "#.*$", ""));
 
-    # 6) PURGE checks (with ACL)
+    # 6) PURGE checks
     if (req.method == "PURGE") {
         if (!client.ip ~ purge) {
             return (synth(403, "Forbidden"));
         }
+        # xkey-based purge if header present
         if (req.http.xkey) {
-            # xkey-based selective purge
             set req.http.n_gone = xkey.purge(req.http.xkey);
             return (synth(200, "Purged " + req.http.n_gone + " objects"));
         } else {
-            # fallback to ban-lurker if no xkey present
             ban("obj.http.x-url == " + req.url + " && obj.http.x-host == " + req.http.host);
             return (synth(200, "Banned via ban-lurker"));
         }
     }
 
-    # 7) Non-idempotent methods -> pass
+    # 7) Pass non-idempotent methods
     if (req.method != "GET" && req.method != "HEAD") {
         return (pass);
     }
 
-    # 8) Known heavy bots (simple user-agent check)
+    # 8) Basic known-bot checks
     if (req.http.User-Agent ~ "(?i)(ahrefs|semrush|mj12bot|dotbot|petalbot)") {
         if (vsthrottle.is_denied("bot:" + client.ip, 20, 60s)) {
             return (synth(429, "Bot traffic blocked"));
         }
     }
 
-    # 9) More thorough generic bot detection
+    # 9) Generic bot/crawler checks (excludes major search engines)
     if (req.http.User-Agent ~ "(?i)(bot|crawl|slurp|spider)") {
-        # Exclude common search engine bots we want to allow
         if (req.http.User-Agent !~ "(?i)(googlebot|bingbot|yandex|baiduspider)") {
-            # DNS-based check (reverse DNS)
+            # DNS-based verification
             if (!std.dns("txt", regsub(client.ip, "^([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)$", "\4.\3.\2.\1.in-addr.arpa"))) {
                 if (vsthrottle.is_denied("bot:" + client.ip, 50, 60s)) {
                     unix.syslog(unix.LOG_WARNING, "Generic Bot banned: " + client.ip);
@@ -336,7 +318,7 @@ sub vcl_recv {
 
     # 10) Rate-limiting for general traffic
     if (vsthrottle.is_denied(client.ip, 250, 60s)) {
-        # If they exceed higher threshold, block harder
+        # Second-level threshold
         if (vsthrottle.is_denied(client.ip, 350, 300s)) {
             unix.syslog(unix.LOG_WARNING, "Heavy rate-limit exceeded: " + client.ip);
             return (synth(429, "Too Many Requests"));
@@ -344,36 +326,35 @@ sub vcl_recv {
         return (synth(429, "Rate Limited"));
     }
 
-    # 11) WordPress & WooCommerce logic
-    #     Pass for admin, login, or if user is logged in
+    # 11) WordPress & WooCommerce checks
+    #     - Logged-in user or WP admin -> pass
     if (is_admin_area() || is_logged_in()) {
         return (pass);
     }
-    #     Pass if wc-ajax (AJAX cart ops)
+    #     - wc-ajax, cart, checkout, etc. -> pass
     if (req.url ~ "wc-ajax=") {
         return (pass);
     }
-    #     Also pass for certain WC endpoints (cart, checkout, etc.)
     if (req.url ~ "(wp-admin|wp-login|wc-api|checkout|cart|my-account|add-to-cart|logout|lost-password)") {
         return (pass);
     }
-    #     Optionally pass WP REST API (if you want it uncached)
+    #     - WP REST API (optional)
     if (is_wp_rest_api()) {
         return (pass);
     }
 
     # 12) Static file handling
     if (req.url ~ "(?i)\.(7z|avi|bmp|bz2|css|csv|doc|docx|eot|flac|flv|gif|gz|ico|jpe?g|js|less|mka|mkv|mov|mp3|mp4|mpeg|mpg|odt|otf|ogg|ogm|opus|pdf|png|ppt|pptx|rar|rtf|svgz?|swf|tar|tbz|tgz|ttf|txt|txz|wav|web[mp]|woff2?|xlsx|xml|xz|zip)(\?.*)?$") {
-        unset req.http.Cookie;        # no cookies for static
-        set req.http.X-Static = "1";  # custom flag
+        unset req.http.Cookie;
+        set req.http.X-Static = "1";
         return (hash);
     }
 
-    # 13) Grace period for dynamic content
+    # 13) Grace for dynamic content
     if (req.http.X-Grace) {
         set req.grace = std.duration(req.http.X-Grace, 24h);
     } else {
-        # e.g. base of 2h, plus random up to 1h for staggered revalidation
+        # 2h base + random up to 1h
         set req.grace = 2h + std.random(30m, 3600);
     }
 
@@ -384,7 +365,7 @@ sub vcl_recv {
 # vcl_backend_response
 # ------------------------------------------------------------------------------
 sub vcl_backend_response {
-    # 1) Saint mode for 5xx
+    # 1) Saint Mode for 5xx
     if (beresp.status >= 500) {
         set beresp.saintmode = 30s;
         return (retry);
@@ -393,20 +374,20 @@ sub vcl_backend_response {
     # 2) ESI detection
     if (beresp.http.Surrogate-Control ~ "ESI/1.0") {
         unset beresp.http.Surrogate-Control;
-        set beresp.do_esi = true;
+        set beresp.do_esi    = true;
         set beresp.do_stream = true;
         if (beresp.http.content-type ~ "text") {
             set beresp.do_gzip = true;
         }
     }
 
-    # 3) Static assets
+    # 3) Static asset caching
     if (bereq.http.X-Static == "1" || bereq.url ~ "\.(?i)(css|js|jpg|jpeg|png|gif|ico|woff2)$") {
-        set beresp.ttl  = 365d;
-        set beresp.grace= 7d;
-        set beresp.keep = 7d;
+        set beresp.ttl        = 365d;
+        set beresp.grace      = 7d;
+        set beresp.keep       = 7d;
         set beresp.http.Cache-Control = "public, max-age=31536000, immutable";
-        set beresp.http.Vary = "Accept-Encoding";
+        set beresp.http.Vary  = "Accept-Encoding";
 
         # Stream large files
         if (std.integer(beresp.http.Content-Length, 0) > 5242880) {
@@ -423,23 +404,23 @@ sub vcl_backend_response {
         }
     }
     else {
-        # 4) Dynamic content defaults
+        # 4) Dynamic content default TTL
         if (!beresp.http.Cache-Control) {
-            set beresp.ttl  = 4h;
-            set beresp.grace= 24h;
-            set beresp.keep = 24h;
+            set beresp.ttl   = 4h;
+            set beresp.grace = 24h;
+            set beresp.keep  = 24h;
             set beresp.http.Cache-Control = "public, max-age=14400";
         }
     }
 
-    # 5) If 5xx is present, short TTL + attempt to abandon
+    # 5) If 5xx, short TTL + possible abandon
     if (beresp.status >= 500) {
         set beresp.ttl   = 1s;
         set beresp.grace = 5s;
         return (abandon);
     }
 
-    # 6) Body compression optimization for text-based or JSON content
+    # 6) Body compression for text/JSON/JS
     if (beresp.http.content-type ~ "text" ||
         beresp.http.content-type ~ "application/json" ||
         beresp.http.content-type ~ "application/javascript") {
@@ -448,7 +429,7 @@ sub vcl_backend_response {
             set beresp.do_gzip = false;
         } else {
             set beresp.do_gzip = true;
-            # Stream large text
+            # For large dynamic content, stream as well
             if (std.integer(beresp.http.Content-Length, 0) > 102400) {
                 set beresp.do_stream = true;
             }
@@ -460,7 +441,7 @@ sub vcl_backend_response {
 # vcl_deliver
 # ------------------------------------------------------------------------------
 sub vcl_deliver {
-    # 1) Remove or mask revealing headers
+    # 1) Remove sensitive headers
     unset resp.http.Server;
     unset resp.http.X-Powered-By;
     unset resp.http.X-Varnish;
@@ -469,7 +450,7 @@ sub vcl_deliver {
     # 2) Add global security headers
     call add_security_headers;
 
-    # 3) Debug info for trusted networks only
+    # 3) Debug info if client is in trusted network
     if (client.ip ~ trusted_networks) {
         set resp.http.X-Cache      = (obj.hits > 0) ? "HIT" : "MISS";
         set resp.http.X-Cache-Hits = obj.hits;
@@ -485,8 +466,7 @@ sub vcl_deliver {
         }
     }
 
-    # If you pass user IDs from your application, you can expose them here 
-    # for debugging, personalization, or logging.
+    # Show user ID if your application passes X-User-ID
     if (req.http.X-User-ID) {
         set resp.http.X-User-Cache-ID = req.http.X-User-ID;
     }
@@ -496,30 +476,31 @@ sub vcl_deliver {
 # vcl_synth
 # ------------------------------------------------------------------------------
 sub vcl_synth {
-    # e.g., 750 -> 301 redirect
+    # 301 redirect if status 750
     if (resp.status == 750) {
         set resp.status = 301;
         set resp.http.Location = "https://" + req.http.Host + req.url;
         return (deliver);
     }
 
-    # Handle rate-limited or custom errors with JSON
+    # Rate-limited or custom error response
     if (resp.status == 429) {
-        set resp.http.Retry-After = "60";
+        set resp.http.Retry-After  = "60";
         set resp.http.Content-Type = "application/json";
         synthetic({"{\"error\": \"Too many requests\", \"retry_after\": 60}"});
     }
 
-    # Add security headers even on error pages
+    # Add security headers even on error
     call add_security_headers;
 
     return (deliver);
 }
 
 # ------------------------------------------------------------------------------
-# Custom Error Page Generator (Optional)
+# Optional: Custom Error Page Generator
 # ------------------------------------------------------------------------------
 sub generate_error_page {
-    # If you want to build a custom error page, do it here:
-    # e.g. synthetic("<html><body><h1>Something went wrong.</h1></body></html>");
+    # Example usage:
+    # synthetic("<html><body><h1>Something went wrong!</h1></body></html>");
+    # set resp.http.Content-Type = "text/html; charset=utf-8";
 }
