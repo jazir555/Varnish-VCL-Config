@@ -15,8 +15,9 @@ import cookie;
 import header;
 import vtc;  # Optional for local testing or advanced Varnish testcases
 
-# ------------------------------------------------------------------------------
-# Suggested varnishd runtime parameters (adjust to taste):
+###############################################################################
+# Suggested varnishd runtime parameters (adjust as needed):
+#
 # varnishd \
 #   -p workspace_client=256k \
 #   -p workspace_backend=256k \
@@ -29,8 +30,7 @@ import vtc;  # Optional for local testing or advanced Varnish testcases
 #   -p http_resp_size=64k \
 #   -p http_req_size=64k
 #
-# You can further tune these depending on your concurrency & memory resources.
-# ------------------------------------------------------------------------------
+###############################################################################
 
 # ------------------------------------------------------------------------------
 # ACLs
@@ -219,17 +219,13 @@ sub clean_query_parameters {
 }
 
 # ------------------------------------------------------------------------------
-# NEW FEATURE:
-# Remove non-essential WordPress cookies that do not affect front-end rendering.
-# (For example, wp-settings*, wp-test*, etc.)
-# This allows static/dynamic pages to be cached for non-logged in users
-# while retaining important session info for actual logged-in or cart usage.
+# Remove non-essential WordPress cookies
 # ------------------------------------------------------------------------------
 sub remove_unnecessary_wp_cookies {
     if (req.http.Cookie) {
         # Only remove these cookies if the user is not recognized as "logged in".
         if (!is_logged_in()) {
-            # Common WordPress settings cookies that don't affect page content
+            # Common WP settings cookies that don't affect page content
             set req.http.Cookie = regsuball(
                 req.http.Cookie,
                 "(^|; )wp-settings-[^=]*=[^;]+(; |$)",
@@ -380,8 +376,7 @@ sub vcl_recv {
     }
 
     # NEW FEATURE:
-    # Remove non-critical WP cookies that do not affect final HTML for
-    # non-logged-in users
+    # Remove non-critical WP cookies for non-logged-in users
     call remove_unnecessary_wp_cookies;
 
     # 12) Static file handling
@@ -397,6 +392,23 @@ sub vcl_recv {
     } else {
         # 2h base + random up to 1h
         set req.grace = 2h + std.random(30m, 3600);
+    }
+
+    ############################################################################
+    # NEW IMPROVEMENTS ADDED BELOW
+    ############################################################################
+
+    # (A) Handle Range requests (for partial content) via pass
+    #     This avoids complexity with partial caching. If you want
+    #     full caching of partial content, you can remove this pass.
+    if (req.http.Range) {
+        return (pass);
+    }
+
+    # (B) Handle WordPress Heartbeat (wp-admin/admin-ajax.php?action=heartbeat)
+    #     to avoid caching those short AJAX requests.
+    if (req.url ~ "wp-admin/admin-ajax.php" && req.http.body ~ "action=heartbeat") {
+        return (pass);
     }
 
     return (hash);
@@ -422,7 +434,6 @@ sub vcl_backend_response {
         }
     }
 
-    # NEW FEATURE:
     # If the origin sets X-Purge-Keys, we attach them as xkey for advanced
     # surrogate key purging.
     if (beresp.http.X-Purge-Keys) {
@@ -434,8 +445,9 @@ sub vcl_backend_response {
         set beresp.ttl        = 365d;
         set beresp.grace      = 7d;
         set beresp.keep       = 7d;
-        # IMPROVEMENT: add stale-while-revalidate/stale-if-error
-        set beresp.http.Cache-Control = "public, max-age=31536000, immutable, stale-while-revalidate=86400, stale-if-error=86400";
+        # Add stale-while-revalidate/stale-if-error
+        set beresp.http.Cache-Control =
+            "public, max-age=31536000, immutable, stale-while-revalidate=86400, stale-if-error=86400";
         set beresp.http.Vary  = "Accept-Encoding";
 
         # Stream large files
@@ -458,8 +470,9 @@ sub vcl_backend_response {
             set beresp.ttl   = 4h;
             set beresp.grace = 24h;
             set beresp.keep  = 24h;
-            # IMPROVEMENT: add stale-while-revalidate, stale-if-error
-            set beresp.http.Cache-Control = "public, max-age=14400, stale-while-revalidate=3600, stale-if-error=43200";
+            # Add stale-while-revalidate, stale-if-error
+            set beresp.http.Cache-Control =
+                "public, max-age=14400, stale-while-revalidate=3600, stale-if-error=43200";
         }
     }
 
@@ -485,6 +498,30 @@ sub vcl_backend_response {
             }
         }
     }
+}
+
+###############################################################################
+# NEW SUBROUTINE: vcl_backend_fetch
+# 
+# Allows you to set or modify backend request headers before retrieval.
+###############################################################################
+sub vcl_backend_fetch {
+    # (A) Ensure we get compressed data from the backend if available
+    if (bereq.http.Accept-Encoding) {
+        set bereq.http.Accept-Encoding = "gzip, deflate, br";
+    } else {
+        set bereq.http.Accept-Encoding = "gzip, deflate";
+    }
+
+    # (B) Optionally, you can do background fetch if objects are about to expire
+    #     This helps keep content fresh without blocking the client.
+    #     Example logic (tweak as needed):
+    if (bereq.uncacheable == false && bereq.ttl < 120s && bereq.ttl > 0s) {
+        set bereq.do_stream = false;
+        set bereq.background_fetch = true;
+    }
+
+    return (fetch);
 }
 
 # ------------------------------------------------------------------------------
