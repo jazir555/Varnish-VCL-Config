@@ -38,12 +38,11 @@ probe backend_probe {
 backend default {
     .host = "192.168.1.50";
     .port = "8080";
-    .first_byte_timeout = 300s; // Increase to 300s for heavy media
+    .first_byte_timeout = 300s;
     .between_bytes_timeout = 60s;
     .probe = backend_probe;
 }
 
-// Director Initialization (unchanged)
 sub vcl_init {
     new cluster = directors.round_robin();
     cluster.add_backend(default);
@@ -55,25 +54,22 @@ sub vcl_hash {
     if (req.http.host) {
         hash_data(req.http.host);
     }
-    // Only add necessary headers to the hash
     if (req.http.X-Forwarded-Proto) {
         hash_data(req.http.X-Forwarded-Proto);
     }
-    if (req.http.X-Logged-In) {
-        hash_data("u=" + req.http.X-Logged-In);
-    }
-    if (req.http.Cookie && req.http.Cookie ~ "wordpress_logged_in_") {
-        hash_data(std.md5(req.http.Cookie)); // Compress cookie using MD5
+    // Use pre-calculated cookie hash from recv
+    if (req.http.X-WP-Logged-In-Hash) {
+        hash_data(req.http.X-WP-Logged-In-Hash);
     }
     return (lookup);
 }
 
 sub vcl_recv {
-    unset req.http.Cookie; // Remove cookies early
-    set req.http.Host = regsub(req.http.Host, ":[0-9]+", ""); // Normalize host
-    set req.url = std.querysort(req.url); // Clean URL query parameters
-    set req.url = regsub(req.url, "#.*$", ""); // Remove URL fragments
-    set req.url = regsub(req.url, "\?$", ""); // Trim trailing '?'
+    // Normalize host and URL first
+    set req.http.Host = regsub(req.http.Host, ":[0-9]+", "");
+    set req.url = std.querysort(req.url);
+    set req.url = regsub(req.url, "#.*$", "");
+    set req.url = regsub(req.url, "\?$", "");
 
     // Custom HTTPS redirect
     if (req.restarts == 0 && req.http.X-Forwarded-Proto !~ "(?i)https") {
@@ -95,34 +91,48 @@ sub vcl_recv {
         return (synth(405));
     }
 
-    // Bot mitigation (improved logic)
+    // Bot mitigation
     if (req.http.User-Agent ~ "(?i)(bot|crawl|slurp|spider|libwww|wget|curl)" &&
         req.http.User-Agent !~ "(?i)(googlebot|bingbot|yandex|baiduspider)") {
         return (synth(403));
     }
-    if (vsthrottle.is_denied(client.ip, 200, 60s)) { // Rate limiting
+
+    // Rate limiting
+    if (vsthrottle.is_denied(client.ip, 200, 60s)) {
         return (synth(429));
     }
 
-    // Bypass dynamic requests (optimized regex)
-    if (req.url ~ "^/(cart|checkout|my-account|wp-admin|wp-login.php|wc-api|wc-)" ||
-        req.url ~ "\?(add-to-cart|wc-api|remove_item|variable)=|" ||
-        req.http.Cookie ~ "(wordpress_logged_in|wp_woocommerce_session_|woocommerce_items_in_cart|woocommerce_cart_hash)_" ||
-        req.http.Cookie ~ "woocommerce-current-cart") {
+    // Pre-process cookies for logged-in users before unsetting
+    if (req.http.Cookie) {
+        // Capture WordPress login state before removing cookies
+        if (req.http.Cookie ~ "wordpress_logged_in_") {
+            set req.http.X-WP-Logged-In-Hash = std.md5(req.http.Cookie);
+        }
+        // Bypass cache for dynamic sessions
+        if (req.http.Cookie ~ "(wordpress_logged_in|wp_woocommerce_session_|woocommerce_items_in_cart)") {
+            return (pass);
+        }
+    }
+
+    // Bypass dynamic requests
+    if (req.url ~ "^/(cart|checkout|my-account|wp-admin|wp-login\.php|wc-(api|ajax))" ||
+        req.url ~ "\?(add-to-cart|remove_item|variable)=") {
         return (pass);
     }
 
+    // Remove cookies for cacheable requests
+    unset req.http.Cookie;
+
     // Optimize static assets
-    if (req.url ~ "(\.(7z|avi|bmp|bz2|css|csv|doc|docx|eot|flac|flv|gif|gz|ico|jpe?g|js|less|mka|mkv|mov|mp3|mp4|mpeg|mpg|odt|otf|ogg|ogm|opus|pdf|png|ppt|pptx|rar|rtf|svg|svgz|swf|tar|tbz|tgz|ttf|txt|txz|wav|webm|webp|woff|woff2|xlsx|xml|xz|zip)(\?.*)?|^/$)") {
-        unset req.http.Cookie;
+    if (req.url ~ "^[^?]+\.(7z|avi|bmp|bz2|css|csv|doc|docx|eot|flac|flv|gif|gz|ico|jpe?g|js|less|mka|mkv|mov|mp3|mp4|mpeg|mpg|odt|otf|ogg|ogm|opus|pdf|png|ppt|pptx|rar|rtf|svgz?|swf|tar|tbz|tgz|ttf|txt|txz|wav|web[mp]|woff2?|xlsx|xml|xz|zip)(\?.*)?$") {
         set req.url = regsub(req.url, "\?.*$", "");
         return (hash);
     }
 
-    // Grace and stale handling (extended grace)
+    // Grace handling
     set req.grace = 60s;
 
-    // Content negotiation (simplified)
+    // Content negotiation
     if (req.http.Accept-Encoding) {
         if (req.url ~ "\.(jpg|jpeg|png|gz|tgz|bz2|tbz|mp3|ogg|swf|mp4|flv)$") {
             unset req.http.Accept-Encoding;
@@ -135,25 +145,25 @@ sub vcl_recv {
 }
 
 sub vcl_backend_response {
-    // ESI processing (unchanged)
+    // ESI processing
     if (beresp.http.Surrogate-Control ~ "ESI/1.0") {
         unset beresp.http.Surrogate-Control;
         set beresp.do_esi = true;
     }
 
-    // Static asset caching (extended TTL)
-    if (bereq.url ~ "\.(jpg|jpeg|png|gif|ico|webp|svg|css|js|woff2?)$") {
-        set beresp.ttl = 90d; // Increase TTL to 90 days
+    // Static asset caching
+    if (bereq.url ~ "\.(jpe?g|png|gif|ico|webp|svg|css|js|woff2?)$") {
+        set beresp.ttl = 90d;
         set beresp.http.Cache-Control = "public, max-age=7776000, immutable";
         unset beresp.http.Set-Cookie;
         set beresp.http.Vary = "Accept-Encoding";
     } else {
-        set beresp.ttl = 2d; // Default TTL
-        set beresp.grace = 12h; // Extended grace period
+        set beresp.ttl = 2d;
+        set beresp.grace = 12h;
         unset beresp.http.Set-Cookie;
     }
 
-    // Security headers (unchanged)
+    // Security headers
     set beresp.http.Content-Security-Policy = 
         "default-src 'self'; script-src 'self' 'unsafe-eval' https://example.com; object-src 'none';";
     unset beresp.http.X-Powered-By;
@@ -161,27 +171,18 @@ sub vcl_backend_response {
     set beresp.http.X-Content-Type-Options = "nosniff";
     set beresp.http.X-Frame-Options = "DENY";
 
-    // Stale-if-error support
-    set beresp.uncacheable = false; // Use cache more aggressively
-    set beresp.ttl = 300s; // Adjust TTL
-    set beresp.grace = 3h;
+    // Aggressive caching
+    set beresp.uncacheable = false;
 }
 
 sub vcl_deliver {
-    // Enforce HTTPS
-    if (req.http.X-Forwarded-Proto != "https") {
-        set resp.http.Location = "https://" + req.http.Host + req.url;
-        set resp.status = 301;
-        return (deliver);
-    }
-
-    // Header cleanup (remove unnecessary headers)
+    // Header cleanup
     unset resp.http.Server;
     unset resp.http.X-Powered-By;
     unset resp.http.X-Varnish;
     unset resp.http.Via;
 
-    // Trusted network diagnostics (optional)
+    // Trusted network diagnostics
     if (client.ip ~ trusted_networks) {
         set resp.http.X-Cache = obj.hits > 0 ? "HIT" : "MISS";
         set resp.http.X-Cache-Hits = obj.hits;
@@ -192,7 +193,7 @@ sub vcl_deliver {
 }
 
 sub vcl_synth {
-    if (resp.status == 750) { // Custom redirect
+    if (resp.status == 750) {
         set resp.status = 301;
         set resp.http.Location = "https://" + req.http.Host + resp.reason;
         set resp.reason = "Moved Permanently";
