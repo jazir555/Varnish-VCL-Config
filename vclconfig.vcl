@@ -32,6 +32,7 @@ import vtc;  # Optional for local testing or advanced Varnish testcases
 #
 ###############################################################################
 
+
 # ------------------------------------------------------------------------------
 # ACLs
 # ------------------------------------------------------------------------------
@@ -242,6 +243,18 @@ sub remove_unnecessary_wp_cookies {
                 "\1"
             );
 
+            # NEW: Remove WordPress comment_author_* cookies if not logged in
+            set req.http.Cookie = regsuball(
+                req.http.Cookie,
+                "(^|; )comment_author_[^=]*=[^;]+(; |$)",
+                "\1"
+            );
+            set req.http.Cookie = regsuball(
+                req.http.Cookie,
+                "(^|; )comment_author_email_[^=]*=[^;]+(; |$)",
+                "\1"
+            );
+
             # If the cookie header is now empty or only spaces, unset it
             if (req.http.Cookie ~ "^\s*$") {
                 unset req.http.Cookie;
@@ -284,9 +297,27 @@ sub vcl_hit {
 }
 
 # ------------------------------------------------------------------------------
+# NEW: Handle WebSockets / CONNECT in vcl_pipe (optional)
+# ------------------------------------------------------------------------------
+sub vcl_pipe {
+    # If you use WebSockets or CONNECT, ensure we do not break them
+    if (req.http.Upgrade ~ "(?i)websocket") {
+        return (pipe);
+    }
+    return (pipe);
+}
+
+# ------------------------------------------------------------------------------
 # vcl_recv: Entry Point for Client Requests
 # ------------------------------------------------------------------------------
 sub vcl_recv {
+    # NEW: Ensure X-Forwarded-For always includes the client IP
+    if (!req.http.X-Forwarded-For) {
+        set req.http.X-Forwarded-For = client.ip;
+    } else {
+        set req.http.X-Forwarded-For = req.http.X-Forwarded-For + ", " + client.ip;
+    }
+
     # 1) Socket pacing for large vs. smaller content
     if (tcp.is_idle(client.socket)) {
         if (req.url ~ "\.(mp4|mkv|iso)$") {
@@ -394,24 +425,37 @@ sub vcl_recv {
         set req.grace = 2h + std.random(30m, 3600);
     }
 
-    ############################################################################
-    # NEW IMPROVEMENTS ADDED BELOW
-    ############################################################################
-
-    # (A) Handle Range requests (for partial content) via pass
-    #     This avoids complexity with partial caching. If you want
-    #     full caching of partial content, you can remove this pass.
+    # NEW: Handle Range requests by passing (can be replaced by slicing logic if desired)
     if (req.http.Range) {
         return (pass);
     }
 
-    # (B) Handle WordPress Heartbeat (wp-admin/admin-ajax.php?action=heartbeat)
-    #     to avoid caching those short AJAX requests.
+    # NEW: Handle WP Heartbeat (short Ajax requests)
     if (req.url ~ "wp-admin/admin-ajax.php" && req.http.body ~ "action=heartbeat") {
         return (pass);
     }
 
     return (hash);
+}
+
+# ------------------------------------------------------------------------------
+# vcl_backend_fetch
+# ------------------------------------------------------------------------------
+sub vcl_backend_fetch {
+    # (A) Ensure we get compressed data from the backend if available
+    if (bereq.http.Accept-Encoding) {
+        set bereq.http.Accept-Encoding = "gzip, deflate, br";
+    } else {
+        set bereq.http.Accept-Encoding = "gzip, deflate";
+    }
+
+    # (B) Background fetch for near-expiry content (keeps popular objects fresh)
+    if (bereq.uncacheable == false && bereq.ttl < 120s && bereq.ttl > 0s) {
+        set bereq.do_stream = false;
+        set bereq.background_fetch = true;
+    }
+
+    return (fetch);
 }
 
 # ------------------------------------------------------------------------------
@@ -498,30 +542,21 @@ sub vcl_backend_response {
             }
         }
     }
-}
 
-###############################################################################
-# NEW SUBROUTINE: vcl_backend_fetch
-# 
-# Allows you to set or modify backend request headers before retrieval.
-###############################################################################
-sub vcl_backend_fetch {
-    # (A) Ensure we get compressed data from the backend if available
-    if (bereq.http.Accept-Encoding) {
-        set bereq.http.Accept-Encoding = "gzip, deflate, br";
-    } else {
-        set bereq.http.Accept-Encoding = "gzip, deflate";
+    # NEW: Optionally slice big files if you want partial caching with chunk vmod
+    #      (This is an alternative to returning pass for Range requests.)
+    # if (bereq.http.Range) {
+    #     # For example, slice into 1MB segments
+    #     chunk.slice(beresp, 1MB);
+    # }
+
+    # NEW: Optionally generate ETag if the backend doesn't provide one and content is suitable
+    if (!beresp.http.ETag &&
+        (beresp.http.content-type ~ "text" ||
+         beresp.http.content-type ~ "application/json" ||
+         beresp.http.content-type ~ "application/javascript")) {
+        set beresp.http.ETag = "W/\"" + std.digest(beresp.http.Content-Length + bereq.url, "sha256") + "\"";
     }
-
-    # (B) Optionally, you can do background fetch if objects are about to expire
-    #     This helps keep content fresh without blocking the client.
-    #     Example logic (tweak as needed):
-    if (bereq.uncacheable == false && bereq.ttl < 120s && bereq.ttl > 0s) {
-        set bereq.do_stream = false;
-        set bereq.background_fetch = true;
-    }
-
-    return (fetch);
 }
 
 # ------------------------------------------------------------------------------
