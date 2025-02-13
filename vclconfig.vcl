@@ -37,7 +37,7 @@ import re2;        # Use the RE2 vmod for faster regex matching
 #
 # For HTTP/2 or HTTP/3, place a TLS terminator (e.g., Hitch, HAProxy, Nginx)
 # in front of Varnish to handle TLS + H2/H3. Varnish will still speak HTTP/1.1
-# to the backend, but you can set Alt-Svc and other hints as below.
+# to the backend, but you can set Alt-Svc or other hints as below.
 ###############################################################################
 
 # ------------------------------------------------------------------------------
@@ -90,7 +90,7 @@ probe backend_probe {
 # Backend Configuration
 # ------------------------------------------------------------------------------
 backend default {
-    .host = "192.168.1.50";      # Adjust to your environment
+    .host = "192.168.1.50";  # Adjust for your environment
     .port = "8080";
     .first_byte_timeout     = 60s;
     .between_bytes_timeout  = 15s;
@@ -203,7 +203,7 @@ sub is_wp_rest_api {
 
 # NEW: WP Preview detection
 sub is_wp_preview {
-    # WordPress previews often have ?preview=true or preview_id=
+    # WordPress previews often have ?preview=true or ?preview_id=
     if (re2.find(req.url, "(preview=true|preview_id=)")) {
         return(true);
     }
@@ -264,7 +264,7 @@ sub clean_query_parameters {
         "(^|&)(_ga|_ke|mr:[A-Za-z0-9_]+|ncid|platform|spm|sp_|zan-src|mtm|trk|si)=",
         "&"
     );
-    set req.url = regsub(req.url, "(\?|&)+$", "");
+    set req.url = regsub(req.url, "(\\?|&)+$", "");
 }
 
 # ------------------------------------------------------------------------------
@@ -337,7 +337,7 @@ sub vcl_hash {
         hash_data(req.http.X-Forwarded-Proto);
     }
 
-    # Optional per-user caching (e.g., membership sites):
+    # Optional per-user caching (e.g., membership sites)
     if (req.http.X-User-ID) {
         hash_data(req.http.X-User-ID);
     }
@@ -349,7 +349,7 @@ sub vcl_hash {
 # vcl_hit
 # ------------------------------------------------------------------------------
 sub vcl_hit {
-    # NEW: Optional background refresh (advanced usage) - RE-ENABLED
+    # Optional background refresh (advanced usage) - RE-ENABLED
     if (obj.ttl < 30s && obj.ttl > 0s && std.healthy(req.backend_hint)) {
         std.log("Background fetch triggered for near-expiry object: " + req.url);
         return (miss);
@@ -378,7 +378,7 @@ sub vcl_pipe {
 # vcl_recv: Entry Point for Client Requests
 # ------------------------------------------------------------------------------
 sub vcl_recv {
-    # 1) Ensure X-Forwarded-For always includes the client IP
+    # 1) Ensure X-Forwarded-For always includes client IP
     if (!req.http.X-Forwarded-For) {
         set req.http.X-Forwarded-For = client.ip;
     } else {
@@ -436,7 +436,7 @@ sub vcl_recv {
     # 10) Generic bot/crawler checks (excludes major search engines)
     if (re2.find(req.http.User-Agent, "(?i)(bot|crawl|slurp|spider)")) {
         if (!re2.find(req.http.User-Agent, "(?i)(googlebot|bingbot|yandex|baiduspider)")) {
-            # DNS-based verification example (could be expanded if needed)
+            # DNS-based verification example (could be expanded)
             if (!std.dns("txt", regsub(client.ip, "^([0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+)$", "\\4.\\3.\\2.\\1.in-addr.arpa"))) {
                 if (vsthrottle.is_denied("bot:" + client.ip, 50, 60s)) {
                     unix.syslog(unix.LOG_WARNING, "Generic Bot banned: " + client.ip);
@@ -465,8 +465,7 @@ sub vcl_recv {
     }
 
     # 12) WordPress & WooCommerce checks
-
-    #     A) If WP Admin area or logged-in user -> pass
+    #     A) If WP Admin area or logged-in user => pass
     if (is_admin_area() || is_logged_in()) {
         return (pass);
     }
@@ -484,7 +483,7 @@ sub vcl_recv {
         return (pass);
     }
 
-    #     D) WP REST API (optional)
+    #     D) WP REST API
     if (is_wp_rest_api()) {
         return (pass);
     }
@@ -511,19 +510,18 @@ sub vcl_recv {
         set req.grace = 2h + std.random(30m, 3600);
     }
 
-    # 15) Handle Range requests by passing (can be replaced by chunk slicing logic)
+    # 15) Handle Range requests by passing (can be replaced by chunk logic)
     if (req.http.Range) {
         return (pass);
     }
 
-    # 16) Handle WP Heartbeat (short Ajax requests)
+    # 16) Handle WP Heartbeat (Ajax)
     if (re2.find(req.url, "wp-admin/admin-ajax\\.php") && req.http.body ~ "action=heartbeat") {
         return (pass);
     }
 
     # NEW: (Optional) ESI approach for cart fragments or partial placeholders
     # if (re2.find(req.url, "cart-fragment-esi")) {
-    #     # Potential partial caching approach
     #     return (pass);
     # }
 
@@ -541,7 +539,7 @@ sub vcl_backend_fetch {
         set bereq.http.Accept-Encoding = "gzip, deflate";
     }
 
-    # (B) Background fetch for near-expiry content (keeps popular objects fresh)
+    # (B) Background fetch for near-expiry content
     if (bereq.uncacheable == false && bereq.ttl < 120s && bereq.ttl > 0s) {
         set bereq.do_stream = false;
         set bereq.background_fetch = true;
@@ -612,14 +610,24 @@ sub vcl_backend_response {
                 "public, max-age=14400, stale-while-revalidate=3600, stale-if-error=43200";
         }
 
-        # OPTIONAL: If this is a feed (e.g., /feed/ or ?feed=)
+        # OPTIONAL: If this is a feed (e.g. /feed/ or ?feed=)
         if (re2.find(bereq.url, "(^|/)feed/") || re2.find(bereq.url, "(\\?|&)feed=")) {
             set beresp.ttl   = 10m;
             set beresp.grace = 1h;
         }
+
+        # NEW: Ensure we Vary by device type for dynamic objects
+        # (We already hash by device, but adding this ensures any upstream/CDN respects it.)
+        if (beresp.http.Vary) {
+            if (! re2.find(beresp.http.Vary, "X-Device-Type")) {
+                set beresp.http.Vary = beresp.http.Vary ", X-Device-Type";
+            }
+        } else {
+            set beresp.http.Vary = "X-Device-Type";
+        }
     }
 
-    # NEW: Negative caching for 404 or 410
+    # NEW: Negative caching for 404/410
     if (beresp.status == 404 || beresp.status == 410) {
         set beresp.ttl   = 30s;
         set beresp.grace = 5m;
@@ -646,9 +654,15 @@ sub vcl_backend_response {
     # NEW: Optionally generate ETag if none is provided
     if (!beresp.http.ETag &&
         re2.find(beresp.http.Content-Type, "(?i)(text|application/json|application/javascript)")) {
-        set beresp.http.ETag = "W/\"" +
-            std.digest(beresp.http.Content-Length + bereq.url, "sha256") + "\"";
+        set beresp.http.ETag =
+            "W/\"" + std.digest(beresp.http.Content-Length + bereq.url, "sha256") + "\"";
     }
+
+    # (Optional) Generate a Last-Modified header if none is present
+    # if (!beresp.http.Last-Modified &&
+    #     re2.find(beresp.http.Content-Type, "(?i)(text|application/json|application/javascript)")) {
+    #     set beresp.http.Last-Modified = std.tolower(std.timestamp());
+    # }
 }
 
 # ------------------------------------------------------------------------------
