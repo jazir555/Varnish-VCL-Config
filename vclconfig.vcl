@@ -16,10 +16,9 @@ import xkey;
 import bodyaccess;
 import cookie;
 import header;
-import vtc;       # Optional for local testing
-import saintmode; # RE-ENABLED for advanced 5xx "saint mode" recovery
-# import std_syslog; # If advanced syslog is desired beyond `unix.syslog`
-# import re2;        # If you want faster regex matching (optional)
+import vtc;         # Optional for local testing
+import saintmode;  # RE-ENABLED for advanced 5xx "saint mode" recovery
+import re2;        # Use the RE2 vmod for faster regex matching
 
 ###############################################################################
 # Suggested varnishd runtime parameters (adjust as needed):
@@ -156,7 +155,7 @@ sub add_security_headers {
     set resp.http.X-Frame-Options           = "SAMEORIGIN";
 
     # Minimal default CSP for *.html or *.php
-    if (req.url ~ "\.(html|php)$") {
+    if (re2.match(req.url, "\\.(html|php)$", "")) {
         set resp.http.Content-Security-Policy =
             "default-src 'self' https: 'unsafe-inline' 'unsafe-eval';";
     }
@@ -178,15 +177,10 @@ sub vcl_backend_error {
 # WordPress / WooCommerce Helper Routines
 # ------------------------------------------------------------------------------
 sub is_logged_in {
-    # Typical WP/Woo logged-in cookies
     if (req.http.Cookie) {
-        if (
-            req.http.Cookie ~ "wordpress_logged_in" ||
-            req.http.Cookie ~ "wordpress_sec_" ||
-            req.http.Cookie ~ "wp_woocommerce_session" ||
-            req.http.Cookie ~ "woocommerce_items_in_cart" ||
-            req.http.Cookie ~ "woocommerce_cart_hash"
-        ) {
+        # RE2 single-pattern approach for typical WP/Woo "logged-in" cookies
+        if (re2.find(req.http.Cookie,
+            "(wordpress_logged_in|wordpress_sec_|wp_woocommerce_session|woocommerce_items_in_cart|woocommerce_cart_hash)")) {
             return(true);
         }
     }
@@ -194,14 +188,14 @@ sub is_logged_in {
 }
 
 sub is_admin_area {
-    if (req.url ~ "(wp-admin|wp-login\.php)") {
+    if (re2.find(req.url, "(wp-admin|wp-login\\.php)")) {
         return(true);
     }
     return(false);
 }
 
 sub is_wp_rest_api {
-    if (req.url ~ "^/wp-json/") {
+    if (re2.match(req.url, "^/wp-json/", "")) {
         return(true);
     }
     return(false);
@@ -209,8 +203,8 @@ sub is_wp_rest_api {
 
 # NEW: WP Preview detection
 sub is_wp_preview {
-    # WordPress previews often have `?preview=true` or `preview_id=`
-    if (req.url ~ "(preview=true|preview_id=)") {
+    # WordPress previews often have ?preview=true or preview_id=
+    if (re2.find(req.url, "(preview=true|preview_id=)")) {
         return(true);
     }
     return(false);
@@ -218,13 +212,11 @@ sub is_wp_preview {
 
 # NEW: Detect if WooCommerce cart cookie is empty
 sub cart_cookie_empty {
-    # If the user has a cookie like "woocommerce_items_in_cart=0" or if
-    # "woocommerce_items_in_cart" is absent, treat it as empty.
     if (req.http.Cookie) {
-        if (req.http.Cookie !~ "woocommerce_items_in_cart") {
+        if (!re2.find(req.http.Cookie, "woocommerce_items_in_cart")) {
             return(true);
         }
-        if (req.http.Cookie ~ "woocommerce_items_in_cart=0") {
+        if (re2.find(req.http.Cookie, "woocommerce_items_in_cart=0")) {
             return(true);
         }
     }
@@ -233,22 +225,26 @@ sub cart_cookie_empty {
 
 # NEW: Helper to detect wc-ajax for cart fragments (potential ESI usage)
 sub is_woocommerce_ajax {
-    if (req.url ~ "wc-ajax=") {
+    if (re2.find(req.url, "wc-ajax=")) {
         return(true);
     }
     return(false);
 }
 
 # ------------------------------------------------------------------------------
-# Device Detection
+# Device Detection (Using re2)
 # ------------------------------------------------------------------------------
 sub detect_device {
-    # (Optional) If you have the re2 VMOD, you could do:
-    # if (re2.match(req.http.User-Agent, "(?i)(mobile|android|...)")) { ... }
-    if (req.http.User-Agent ~ "(?i)(mobile|android|iphone|ipod|tablet|up.browser|up.link|mmp|symbian|smartphone|midp|wap|phone|windows ce)") {
-        set req.http.X-Device-Type = "mobile";
-    } else if (req.http.User-Agent ~ "(?i)(ipad|playbook|silk)") {
-        set req.http.X-Device-Type = "tablet";
+    # Example device detection using a single RE2 pattern
+    if (req.http.User-Agent) {
+        if (re2.find(req.http.User-Agent,
+            "(?i)(mobile|android|iphone|ipod|tablet|up\\.browser|up\\.link|mmp|symbian|smartphone|midp|wap|phone|windows ce)")) {
+            set req.http.X-Device-Type = "mobile";
+        } else if (re2.find(req.http.User-Agent, "(?i)(ipad|playbook|silk)")) {
+            set req.http.X-Device-Type = "tablet";
+        } else {
+            set req.http.X-Device-Type = "desktop";
+        }
     } else {
         set req.http.X-Device-Type = "desktop";
     }
@@ -259,8 +255,15 @@ sub detect_device {
 # ------------------------------------------------------------------------------
 sub clean_query_parameters {
     # Remove marketing/tracking parameters
-    set req.url = querystring.regfilter(req.url, "^(utm_|fbclid|gclid|mc_eid|ref|cx|ie|cof|siteurl|zanpid|origin|amp)");
-    set req.url = regsuball(req.url, "(^|&)(_ga|_ke|mr:[A-Za-z0-9_]+|ncid|platform|spm|sp_|zan-src|mtm|trk|si)=", "&");
+    set req.url = querystring.regfilter(
+        req.url,
+        "^(utm_|fbclid|gclid|mc_eid|ref|cx|ie|cof|siteurl|zanpid|origin|amp)"
+    );
+    set req.url = regsuball(
+        req.url,
+        "(^|&)(_ga|_ke|mr:[A-Za-z0-9_]+|ncid|platform|spm|sp_|zan-src|mtm|trk|si)=",
+        "&"
+    );
     set req.url = regsub(req.url, "(\?|&)+$", "");
 }
 
@@ -300,7 +303,7 @@ sub remove_unnecessary_wp_cookies {
                 "\1"
             );
 
-            # NEW: Strip WooCommerce cart cookies if the cart is definitely empty
+            # NEW: Strip WooCommerce cart cookies if the cart is empty
             if (cart_cookie_empty()) {
                 set req.http.Cookie = regsuball(
                     req.http.Cookie,
@@ -347,7 +350,6 @@ sub vcl_hash {
 # ------------------------------------------------------------------------------
 sub vcl_hit {
     # NEW: Optional background refresh (advanced usage) - RE-ENABLED
-    # If the object is about to expire (e.g., <30s left), attempt to fetch a new copy in the background
     if (obj.ttl < 30s && obj.ttl > 0s && std.healthy(req.backend_hint)) {
         std.log("Background fetch triggered for near-expiry object: " + req.url);
         return (miss);
@@ -366,7 +368,7 @@ sub vcl_hit {
 # Handle WebSockets / CONNECT in vcl_pipe
 # ------------------------------------------------------------------------------
 sub vcl_pipe {
-    if (req.http.Upgrade ~ "(?i)websocket") {
+    if (re2.find(req.http.Upgrade, "(?i)websocket")) {
         return (pipe);
     }
     return (pipe);
@@ -385,7 +387,7 @@ sub vcl_recv {
 
     # 2) Socket pacing for large vs. smaller content
     if (tcp.is_idle(client.socket)) {
-        if (req.url ~ "\.(mp4|mkv|iso)$") {
+        if (re2.find(req.url, "\\.(mp4|mkv|iso)$")) {
             tcp.set_socket_pace(client.socket, 5MB);
         } else {
             tcp.set_socket_pace(client.socket, 1MB);
@@ -425,17 +427,17 @@ sub vcl_recv {
     }
 
     # 9) Basic known-bot checks
-    if (req.http.User-Agent ~ "(?i)(ahrefs|semrush|mj12bot|dotbot|petalbot)") {
+    if (re2.find(req.http.User-Agent, "(?i)(ahrefs|semrush|mj12bot|dotbot|petalbot)")) {
         if (vsthrottle.is_denied("bot:" + client.ip, 20, 60s)) {
             return (synth(429, "Bot traffic blocked"));
         }
     }
 
     # 10) Generic bot/crawler checks (excludes major search engines)
-    if (req.http.User-Agent ~ "(?i)(bot|crawl|slurp|spider)") {
-        if (req.http.User-Agent !~ "(?i)(googlebot|bingbot|yandex|baiduspider)") {
-            # DNS-based verification (example check)
-            if (!std.dns("txt", regsub(client.ip, "^([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)$", "\4.\3.\2.\1.in-addr.arpa"))) {
+    if (re2.find(req.http.User-Agent, "(?i)(bot|crawl|slurp|spider)")) {
+        if (!re2.find(req.http.User-Agent, "(?i)(googlebot|bingbot|yandex|baiduspider)")) {
+            # DNS-based verification example (could be expanded if needed)
+            if (!std.dns("txt", regsub(client.ip, "^([0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+)$", "\\4.\\3.\\2.\\1.in-addr.arpa"))) {
                 if (vsthrottle.is_denied("bot:" + client.ip, 50, 60s)) {
                     unix.syslog(unix.LOG_WARNING, "Generic Bot banned: " + client.ip);
                     return (synth(403, "Bot Access Denied"));
@@ -478,7 +480,7 @@ sub vcl_recv {
     if (is_woocommerce_ajax()) {
         return (pass);
     }
-    if (req.url ~ "(wp-admin|wp-login|wc-api|checkout|cart|my-account|add-to-cart|logout|lost-password)") {
+    if (re2.find(req.url, "(wp-admin|wp-login|wc-api|checkout|cart|my-account|add-to-cart|logout|lost-password)")) {
         return (pass);
     }
 
@@ -491,13 +493,12 @@ sub vcl_recv {
     call remove_unnecessary_wp_cookies;
 
     # 13) Static file handling
-    if (req.url ~ "(?i)\.(7z|avi|bmp|bz2|css|csv|doc|docx|eot|flac|flv|gif|gz|ico|jpe?g|js|less|mka|mkv|mov|mp3|mp4|mpeg|mpg|odt|otf|ogg|ogm|opus|pdf|png|ppt|pptx|rar|rtf|svgz?|swf|tar|tbz|tgz|ttf|txt|txz|wav|web[mp]|woff2?|xlsx|xml|xz|zip)(\?.*)?$") {
+    if (re2.find(req.url, "(?i)\\.(7z|avi|bmp|bz2|css|csv|doc|docx|eot|flac|flv|gif|gz|ico|jpe?g|js|less|mka|mkv|mov|mp3|mp4|mpeg|mpg|odt|otf|ogg|ogm|opus|pdf|png|ppt|pptx|rar|rtf|svgz?|swf|tar|tbz|tgz|ttf|txt|txz|wav|web[mp]|woff2?|xlsx|xml|xz|zip)(\\?.*)?$")) {
         unset req.http.Cookie;
         set req.http.X-Static = "1";
 
-        # OPTIONAL: If you want to ignore query strings on static (like ?ver=123),
-        # uncomment below for a higher cache-hit ratio:
-        # set req.url = regsub(req.url, "\?.*$", "");
+        # OPTIONAL: If you want to ignore query strings on static (like ?ver=123)
+        # set req.url = regsub(req.url, "\\?.*$", "");
 
         return (hash);
     }
@@ -516,14 +517,15 @@ sub vcl_recv {
     }
 
     # 16) Handle WP Heartbeat (short Ajax requests)
-    if (req.url ~ "wp-admin/admin-ajax.php" && req.http.body ~ "action=heartbeat") {
+    if (re2.find(req.url, "wp-admin/admin-ajax\\.php") && req.http.body ~ "action=heartbeat") {
         return (pass);
     }
 
     # NEW: (Optional) ESI approach for cart fragments or partial placeholders
-    # If your WooCommerce or theme plugin inserts ESI for the cart, you could allow caching
-    # while ESI holes out dynamic pieces. This requires matching "ESI" markers from the backend.
-    # e.g. if (req.url ~ "cart-fragment-esi") { ... } => return (pass) or handle partial.
+    # if (re2.find(req.url, "cart-fragment-esi")) {
+    #     # Potential partial caching approach
+    #     return (pass);
+    # }
 
     return (hash);
 }
@@ -534,7 +536,6 @@ sub vcl_recv {
 sub vcl_backend_fetch {
     # (A) Ensure we get compressed data from the backend if available
     if (bereq.http.Accept-Encoding) {
-        # If your backend supports brotli, keep "br"
         set bereq.http.Accept-Encoding = "gzip, deflate, br";
     } else {
         set bereq.http.Accept-Encoding = "gzip, deflate";
@@ -553,7 +554,7 @@ sub vcl_backend_fetch {
 # vcl_backend_response
 # ------------------------------------------------------------------------------
 sub vcl_backend_response {
-    # 1) Saint Mode for 5xx (already in vcl_backend_error, but double-check)
+    # 1) Saint Mode for 5xx
     if (beresp.status >= 500) {
         set beresp.ttl   = 1s;
         set beresp.grace = 5s;
@@ -561,25 +562,25 @@ sub vcl_backend_response {
     }
 
     # 2) ESI detection
-    if (beresp.http.Surrogate-Control ~ "ESI/1.0") {
+    if (re2.find(beresp.http.Surrogate-Control, "ESI/1\\.0")) {
         unset beresp.http.Surrogate-Control;
         set beresp.do_esi    = true;
         set beresp.do_stream = true;
-        if (beresp.http.content-type ~ "text") {
+        if (re2.find(beresp.http.Content-Type, "(?i)text")) {
             set beresp.do_gzip = true;
         }
     }
 
-    # If the origin sets X-Purge-Keys, attach them as xkey for advanced
-    # surrogate key purging.
+    # Surrogate key purging: X-Purge-Keys -> xkey
     if (beresp.http.X-Purge-Keys) {
         xkey.add(beresp.http.X-Purge-Keys);
     }
 
     # 3) Detect static
-    if (bereq.http.X-Static == "1" ||
-        bereq.url ~ "\.(?i)(css|js|jpg|jpeg|png|gif|ico|woff2)$") {
-
+    if (
+        bereq.http.X-Static == "1" ||
+        re2.find(bereq.url, "\\.(?i)(css|js|jpg|jpeg|png|gif|ico|woff2)$")
+    ) {
         set beresp.ttl   = 365d;
         set beresp.grace = 7d;
         set beresp.keep  = 7d;
@@ -595,8 +596,7 @@ sub vcl_backend_response {
         }
 
         # Potential GZIP for text-based assets
-        if (beresp.http.content-type ~ "text" ||
-            beresp.http.content-type ~ "application/(javascript|json|xml)") {
+        if (re2.find(beresp.http.Content-Type, "(?i)(text|application/(javascript|json|xml))")) {
             if (std.integer(beresp.http.Content-Length, 0) > 860) {
                 set beresp.do_gzip = true;
             }
@@ -613,7 +613,7 @@ sub vcl_backend_response {
         }
 
         # OPTIONAL: If this is a feed (e.g., /feed/ or ?feed=)
-        if (bereq.url ~ "(^|/)feed/" || bereq.url ~ "(\?|&)feed=") {
+        if (re2.find(bereq.url, "(^|/)feed/") || re2.find(bereq.url, "(\\?|&)feed=")) {
             set beresp.ttl   = 10m;
             set beresp.grace = 1h;
         }
@@ -626,10 +626,7 @@ sub vcl_backend_response {
     }
 
     # 5) Body compression for text/JSON/JS
-    if (beresp.http.content-type ~ "text" ||
-        beresp.http.content-type ~ "application/json" ||
-        beresp.http.content-type ~ "application/javascript") {
-
+    if (re2.find(beresp.http.Content-Type, "(?i)(text|application/json|application/javascript)")) {
         if (std.integer(beresp.http.Content-Length, 0) < 860) {
             set beresp.do_gzip = false;
         } else {
@@ -648,10 +645,9 @@ sub vcl_backend_response {
 
     # NEW: Optionally generate ETag if none is provided
     if (!beresp.http.ETag &&
-        (beresp.http.content-type ~ "text" ||
-         beresp.http.content-type ~ "application/json" ||
-         beresp.http.content-type ~ "application/javascript")) {
-        set beresp.http.ETag = "W/\"" + std.digest(beresp.http.Content-Length + bereq.url, "sha256") + "\"";
+        re2.find(beresp.http.Content-Type, "(?i)(text|application/json|application/javascript)")) {
+        set beresp.http.ETag = "W/\"" +
+            std.digest(beresp.http.Content-Length + bereq.url, "sha256") + "\"";
     }
 }
 
