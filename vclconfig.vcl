@@ -154,11 +154,15 @@ sub add_security_headers {
     set resp.http.Permissions-Policy        = "interest-cohort=()";
     set resp.http.X-Frame-Options           = "SAMEORIGIN";
 
-    # Minimal default CSP for *.html or *.php
+    # NEW: More modern CSP with 'strict-dynamic' (as an example).
+    #      Adjust to your actual requirements or keep minimal if uncertain.
     if (re2.match(req.url, "\\.(html|php)$", "")) {
         set resp.http.Content-Security-Policy =
-            "default-src 'self' https: 'unsafe-inline' 'unsafe-eval';";
+            "default-src 'self' https: 'unsafe-inline' 'unsafe-eval'; script-src 'strict-dynamic' 'unsafe-inline' https:; object-src 'none';";
     }
+
+    # NEW: DNS Prefetch Control (example)
+    set resp.http.X-DNS-Prefetch-Control = "off";
 }
 
 # ------------------------------------------------------------------------------
@@ -235,7 +239,6 @@ sub is_woocommerce_ajax {
 # Device Detection (Using re2)
 # ------------------------------------------------------------------------------
 sub detect_device {
-    # Example device detection using a single RE2 pattern
     if (req.http.User-Agent) {
         if (re2.find(req.http.User-Agent,
             "(?i)(mobile|android|iphone|ipod|tablet|up\\.browser|up\\.link|mmp|symbian|smartphone|midp|wap|phone|windows ce)")) {
@@ -385,6 +388,16 @@ sub vcl_recv {
         set req.http.X-Forwarded-For = req.http.X-Forwarded-For + ", " + client.ip;
     }
 
+    # NEW: If no X-Forwarded-Proto is present, infer it based on this connection (optional).
+    #      Adjust if you already have a load balancer or TLS terminator handling it.
+    if (!req.http.X-Forwarded-Proto) {
+        if (std.port(server.ip) == 443) {
+            set req.http.X-Forwarded-Proto = "https";
+        } else {
+            set req.http.X-Forwarded-Proto = "http";
+        }
+    }
+
     # 2) Socket pacing for large vs. smaller content
     if (tcp.is_idle(client.socket)) {
         if (re2.find(req.url, "\\.(mp4|mkv|iso)$")) {
@@ -456,10 +469,7 @@ sub vcl_recv {
         return (synth(429, "Rate Limited"));
     }
 
-    # NEW: If there's an Authorization header, pass. Important for:
-    #      - WordPress Application Passwords
-    #      - Basic auth
-    #      - Custom auth tokens
+    # NEW: If there's an Authorization header, we pass (for WP Application Passwords or Basic Auth).
     if (req.http.Authorization) {
         return (pass);
     }
@@ -520,7 +530,7 @@ sub vcl_recv {
         return (pass);
     }
 
-    # NEW: (Optional) ESI approach for cart fragments or partial placeholders
+    # NEW (optional): ESI approach for cart fragments or partial placeholders
     # if (re2.find(req.url, "cart-fragment-esi")) {
     #     return (pass);
     # }
@@ -617,7 +627,6 @@ sub vcl_backend_response {
         }
 
         # NEW: Ensure we Vary by device type for dynamic objects
-        # (We already hash by device, but adding this ensures any upstream/CDN respects it.)
         if (beresp.http.Vary) {
             if (! re2.find(beresp.http.Vary, "X-Device-Type")) {
                 set beresp.http.Vary = beresp.http.Vary ", X-Device-Type";
