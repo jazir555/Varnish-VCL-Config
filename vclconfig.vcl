@@ -397,7 +397,10 @@ sub vcl_recv {
             set req.http.X-Forwarded-Proto = "http";
         }
     }
-
+    # NEW: ESI endpoints pass
+    if (re2.find(req.url, "^/wp-json/wp-esi-enabler/v1/(cart-fragment|full-cart-fragment)")) {
+        return (pass);
+    }
     # 2) Socket pacing for large vs. smaller content
     if (tcp.is_idle(client.socket)) {
         if (re2.find(req.url, "\\.(mp4|mkv|iso)$")) {
