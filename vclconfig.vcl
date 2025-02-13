@@ -13,7 +13,10 @@ import xkey;
 import bodyaccess;
 import cookie;
 import header;
-import vtc;  # Optional for local testing or advanced Varnish testcases
+import vtc; # Optional for local testing or advanced Varnish testcases
+# NEW: Potentially useful for advanced ESI or advanced logging (uncomment if needed)
+# import saintmode;
+# import std_syslog; # If advanced syslog is desired beyond `unix.syslog`
 
 ###############################################################################
 # Suggested varnishd runtime parameters (adjust as needed):
@@ -34,7 +37,6 @@ import vtc;  # Optional for local testing or advanced Varnish testcases
 # in front of Varnish to handle TLS + H2/H3. Varnish will still speak HTTP/1.1
 # to the backend, but you can set Alt-Svc and other hints as below.
 ###############################################################################
-
 
 # ------------------------------------------------------------------------------
 # ACLs
@@ -213,14 +215,21 @@ sub is_wp_preview {
 sub cart_cookie_empty {
     # If the user has a cookie like "woocommerce_items_in_cart=0" or if
     # "woocommerce_items_in_cart" is absent, treat it as empty.
-    # Adjust logic to your needs if your site sets it differently.
     if (req.http.Cookie) {
         if (req.http.Cookie !~ "woocommerce_items_in_cart") {
-            return(true); 
+            return(true);
         }
         if (req.http.Cookie ~ "woocommerce_items_in_cart=0") {
             return(true);
         }
+    }
+    return(false);
+}
+
+# NEW: Helper to detect wc-ajax for cart fragments (potential ESI usage)
+sub is_woocommerce_ajax {
+    if (req.url ~ "wc-ajax=") {
+        return(true);
     }
     return(false);
 }
@@ -285,8 +294,6 @@ sub remove_unnecessary_wp_cookies {
             );
 
             # NEW: Strip WooCommerce cart cookies if the cart is definitely empty
-            #      This allows caching for empty-cart visitors while retaining
-            #      the ability to pass for users with an actual cart.
             if (cart_cookie_empty()) {
                 set req.http.Cookie = regsuball(
                     req.http.Cookie,
@@ -320,7 +327,7 @@ sub vcl_hash {
         hash_data(req.http.X-Forwarded-Proto);
     }
 
-    # Optional per-user caching (e.g., membership sites)
+    # Optional per-user caching (e.g., membership sites):
     if (req.http.X-User-ID) {
         hash_data(req.http.X-User-ID);
     }
@@ -332,6 +339,13 @@ sub vcl_hash {
 # vcl_hit
 # ------------------------------------------------------------------------------
 sub vcl_hit {
+    # # NEW: Optional background refresh (advanced usage):
+    # # If the object is about to expire, attempt to fetch a new copy in the background
+    # if (obj.ttl < 30s && obj.ttl > 0s && std.healthy(req.backend_hint)) {
+    #     std.log("Background fetch triggered for near-expiry object: " + req.url);
+    #     return (miss);
+    # }
+
     if (obj.ttl >= 0s) {
         return (deliver);
     }
@@ -433,9 +447,10 @@ sub vcl_recv {
         return (synth(429, "Rate Limited"));
     }
 
-    # NEW: Pass if there's an Authorization header (common with WP's application
-    #      passwords or any basic auth scenarios). This ensures correct dynamic
-    #      content and avoids serving the wrong cache entry.
+    # NEW: If there's an Authorization header, pass. Important for:
+    #      - WordPress Application Passwords
+    #      - Basic auth areas
+    #      - Custom auth tokens
     if (req.http.Authorization) {
         return (pass);
     }
@@ -453,7 +468,7 @@ sub vcl_recv {
     }
 
     #     C) WooCommerce & WP special endpoints => pass
-    if (req.url ~ "wc-ajax=") {
+    if (is_woocommerce_ajax()) {
         return (pass);
     }
     if (req.url ~ "(wp-admin|wp-login|wc-api|checkout|cart|my-account|add-to-cart|logout|lost-password)") {
@@ -542,7 +557,7 @@ sub vcl_backend_response {
         }
     }
 
-    # If the origin sets X-Purge-Keys, we attach them as xkey for advanced
+    # If the origin sets X-Purge-Keys, attach them as xkey for advanced
     # surrogate key purging.
     if (beresp.http.X-Purge-Keys) {
         xkey.add(beresp.http.X-Purge-Keys);
@@ -552,13 +567,13 @@ sub vcl_backend_response {
     if (bereq.http.X-Static == "1" ||
         bereq.url ~ "\.(?i)(css|js|jpg|jpeg|png|gif|ico|woff2)$") {
 
-        set beresp.ttl        = 365d;
-        set beresp.grace      = 7d;
-        set beresp.keep       = 7d;
+        set beresp.ttl   = 365d;
+        set beresp.grace = 7d;
+        set beresp.keep  = 7d;
 
         set beresp.http.Cache-Control =
             "public, max-age=31536000, immutable, stale-while-revalidate=86400, stale-if-error=86400";
-        set beresp.http.Vary  = "Accept-Encoding";
+        set beresp.http.Vary = "Accept-Encoding";
 
         # Stream large files
         if (std.integer(beresp.http.Content-Length, 0) > 5242880) {
@@ -584,15 +599,14 @@ sub vcl_backend_response {
                 "public, max-age=14400, stale-while-revalidate=3600, stale-if-error=43200";
         }
 
-        # OPTIONAL: If this is a feed (e.g. /feed/ or ?feed=)
+        # OPTIONAL: If this is a feed (e.g., /feed/ or ?feed=)
         if (bereq.url ~ "(^|/)feed/" || bereq.url ~ "(\?|&)feed=") {
-            set beresp.ttl = 10m;
+            set beresp.ttl   = 10m;
             set beresp.grace = 1h;
         }
     }
 
-    # NEW: Negative caching for 404 or 410 (lightly recommended to reduce repeated
-    #      hits on missing content). You can adjust TTL as needed.
+    # NEW: Negative caching for 404 or 410
     if (beresp.status == 404 || beresp.status == 410) {
         set beresp.ttl   = 30s;
         set beresp.grace = 5m;
@@ -621,8 +635,7 @@ sub vcl_backend_response {
         }
     }
 
-    # OPTIONAL: Use chunk vmod for partial caching if you prefer,
-    # especially for big range-based downloads:
+    # OPTIONAL: Use chunk vmod for partial caching / slicing large range requests
     # if (bereq.http.Range) {
     #     chunk.slice(beresp, 1MB);
     # }
@@ -652,7 +665,7 @@ sub vcl_deliver {
     # HTTP/2 / HTTP/3 advertisement
     set resp.http.Alt-Svc = "h3=\":443\"; ma=86400, h3-29=\":443\"; ma=86400";
 
-    # Example: Preload critical assets (replacing old server push)
+    # Example: Preload critical assets (HTTP/2+ approach)
     # if (req.url == "/some-page") {
     #     set resp.http.Link = "</static/app.css>; rel=preload; as=style, </static/app.js>; rel=preload; as=script";
     # }
