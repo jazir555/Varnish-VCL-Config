@@ -1,5 +1,8 @@
 vcl 7.4;
 
+###############################################################################
+# Imports
+###############################################################################
 import std;
 import directors;
 import querystring;
@@ -13,10 +16,10 @@ import xkey;
 import bodyaccess;
 import cookie;
 import header;
-import vtc; # Optional for local testing or advanced Varnish testcases
-# NEW: Potentially useful for advanced ESI or advanced logging (uncomment if needed)
-# import saintmode;
+import vtc;       # Optional for local testing
+import saintmode; # RE-ENABLED for advanced 5xx "saint mode" recovery
 # import std_syslog; # If advanced syslog is desired beyond `unix.syslog`
+# import re2;        # If you want faster regex matching (optional)
 
 ###############################################################################
 # Suggested varnishd runtime parameters (adjust as needed):
@@ -165,6 +168,8 @@ sub add_security_headers {
 sub vcl_backend_error {
     if (beresp.status >= 500) {
         std.log("Saint mode triggered for: " + bereq.url);
+        # Mark this object as "sick" for a short period to avoid repeated fetches
+        saintmode.record(30s);
         return (retry);
     }
 }
@@ -238,6 +243,8 @@ sub is_woocommerce_ajax {
 # Device Detection
 # ------------------------------------------------------------------------------
 sub detect_device {
+    # (Optional) If you have the re2 VMOD, you could do:
+    # if (re2.match(req.http.User-Agent, "(?i)(mobile|android|...)")) { ... }
     if (req.http.User-Agent ~ "(?i)(mobile|android|iphone|ipod|tablet|up.browser|up.link|mmp|symbian|smartphone|midp|wap|phone|windows ce)") {
         set req.http.X-Device-Type = "mobile";
     } else if (req.http.User-Agent ~ "(?i)(ipad|playbook|silk)") {
@@ -339,12 +346,12 @@ sub vcl_hash {
 # vcl_hit
 # ------------------------------------------------------------------------------
 sub vcl_hit {
-    # # NEW: Optional background refresh (advanced usage):
-    # # If the object is about to expire, attempt to fetch a new copy in the background
-    # if (obj.ttl < 30s && obj.ttl > 0s && std.healthy(req.backend_hint)) {
-    #     std.log("Background fetch triggered for near-expiry object: " + req.url);
-    #     return (miss);
-    # }
+    # NEW: Optional background refresh (advanced usage) - RE-ENABLED
+    # If the object is about to expire (e.g., <30s left), attempt to fetch a new copy in the background
+    if (obj.ttl < 30s && obj.ttl > 0s && std.healthy(req.backend_hint)) {
+        std.log("Background fetch triggered for near-expiry object: " + req.url);
+        return (miss);
+    }
 
     if (obj.ttl >= 0s) {
         return (deliver);
@@ -394,7 +401,7 @@ sub vcl_recv {
     # 5) Clean up query parameters
     call clean_query_parameters;
 
-    # 6) Remove URL fragment, sort query
+    # 6) Remove URL fragment, then sort query
     set req.url = std.querysort(regsub(req.url, "#.*$", ""));
 
     # 7) PURGE checks
@@ -449,7 +456,7 @@ sub vcl_recv {
 
     # NEW: If there's an Authorization header, pass. Important for:
     #      - WordPress Application Passwords
-    #      - Basic auth areas
+    #      - Basic auth
     #      - Custom auth tokens
     if (req.http.Authorization) {
         return (pass);
@@ -489,7 +496,7 @@ sub vcl_recv {
         set req.http.X-Static = "1";
 
         # OPTIONAL: If you want to ignore query strings on static (like ?ver=123),
-        # uncomment below for higher cache-hit ratio:
+        # uncomment below for a higher cache-hit ratio:
         # set req.url = regsub(req.url, "\?.*$", "");
 
         return (hash);
@@ -512,6 +519,11 @@ sub vcl_recv {
     if (req.url ~ "wp-admin/admin-ajax.php" && req.http.body ~ "action=heartbeat") {
         return (pass);
     }
+
+    # NEW: (Optional) ESI approach for cart fragments or partial placeholders
+    # If your WooCommerce or theme plugin inserts ESI for the cart, you could allow caching
+    # while ESI holes out dynamic pieces. This requires matching "ESI" markers from the backend.
+    # e.g. if (req.url ~ "cart-fragment-esi") { ... } => return (pass) or handle partial.
 
     return (hash);
 }
@@ -541,10 +553,11 @@ sub vcl_backend_fetch {
 # vcl_backend_response
 # ------------------------------------------------------------------------------
 sub vcl_backend_response {
-    # 1) Saint Mode for 5xx
+    # 1) Saint Mode for 5xx (already in vcl_backend_error, but double-check)
     if (beresp.status >= 500) {
-        set beresp.saintmode = 30s;
-        return (retry);
+        set beresp.ttl   = 1s;
+        set beresp.grace = 5s;
+        return (abandon);
     }
 
     # 2) ESI detection
@@ -612,14 +625,7 @@ sub vcl_backend_response {
         set beresp.grace = 5m;
     }
 
-    # 5) If 5xx, short TTL + possible abandon (already handled above with saintmode)
-    if (beresp.status >= 500) {
-        set beresp.ttl   = 1s;
-        set beresp.grace = 5s;
-        return (abandon);
-    }
-
-    # 6) Body compression for text/JSON/JS
+    # 5) Body compression for text/JSON/JS
     if (beresp.http.content-type ~ "text" ||
         beresp.http.content-type ~ "application/json" ||
         beresp.http.content-type ~ "application/javascript") {
