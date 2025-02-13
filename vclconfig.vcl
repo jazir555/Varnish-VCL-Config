@@ -148,19 +148,13 @@ sub add_security_headers {
     set resp.http.X-XSS-Protection          = "1; mode=block";
     set resp.http.Referrer-Policy           = "strict-origin-when-cross-origin";
     set resp.http.Permissions-Policy        = "interest-cohort=()";
-    # NEW: Add X-Frame-Options
-    set resp.http.X-Frame-Options          = "SAMEORIGIN";
+    set resp.http.X-Frame-Options           = "SAMEORIGIN";
 
     # Minimal default CSP for *.html or *.php
     if (req.url ~ "\.(html|php)$") {
         set resp.http.Content-Security-Policy =
             "default-src 'self' https: 'unsafe-inline' 'unsafe-eval';";
     }
-
-    # Example of setting Access-Control-Allow-Origin for static assets:
-    # if (req.http.X-Static == "1") {
-    #     set resp.http.Access-Control-Allow-Origin = "*";
-    # }
 }
 
 # ------------------------------------------------------------------------------
@@ -211,6 +205,22 @@ sub is_wp_preview {
     # WordPress previews often have `?preview=true` or `preview_id=`
     if (req.url ~ "(preview=true|preview_id=)") {
         return(true);
+    }
+    return(false);
+}
+
+# NEW: Detect if WooCommerce cart cookie is empty
+sub cart_cookie_empty {
+    # If the user has a cookie like "woocommerce_items_in_cart=0" or if
+    # "woocommerce_items_in_cart" is absent, treat it as empty.
+    # Adjust logic to your needs if your site sets it differently.
+    if (req.http.Cookie) {
+        if (req.http.Cookie !~ "woocommerce_items_in_cart") {
+            return(true); 
+        }
+        if (req.http.Cookie ~ "woocommerce_items_in_cart=0") {
+            return(true);
+        }
     }
     return(false);
 }
@@ -274,17 +284,21 @@ sub remove_unnecessary_wp_cookies {
                 "\1"
             );
 
-            # Optional additional cookie removal if desired:
-            # set req.http.Cookie = regsuball(
-            #     req.http.Cookie,
-            #     "(^|; )_ga=[^;]+(; |$)",
-            #     "\1"
-            # );
-            # set req.http.Cookie = regsuball(
-            #     req.http.Cookie,
-            #     "(^|; )_gid=[^;]+(; |$)",
-            #     "\1"
-            # );
+            # NEW: Strip WooCommerce cart cookies if the cart is definitely empty
+            #      This allows caching for empty-cart visitors while retaining
+            #      the ability to pass for users with an actual cart.
+            if (cart_cookie_empty()) {
+                set req.http.Cookie = regsuball(
+                    req.http.Cookie,
+                    "(^|; )woocommerce_items_in_cart=[^;]+(; |$)",
+                    "\1"
+                );
+                set req.http.Cookie = regsuball(
+                    req.http.Cookie,
+                    "(^|; )woocommerce_cart_hash=[^;]+(; |$)",
+                    "\1"
+                );
+            }
 
             # If the cookie header is now empty or only spaces, unset it
             if (req.http.Cookie ~ "^\s*$") {
@@ -419,6 +433,13 @@ sub vcl_recv {
         return (synth(429, "Rate Limited"));
     }
 
+    # NEW: Pass if there's an Authorization header (common with WP's application
+    #      passwords or any basic auth scenarios). This ensures correct dynamic
+    #      content and avoids serving the wrong cache entry.
+    if (req.http.Authorization) {
+        return (pass);
+    }
+
     # 12) WordPress & WooCommerce checks
 
     #     A) If WP Admin area or logged-in user -> pass
@@ -453,8 +474,7 @@ sub vcl_recv {
         set req.http.X-Static = "1";
 
         # OPTIONAL: If you want to ignore query strings on static (like ?ver=123),
-        # uncomment below for higher cache-hit ratio (but also means WP can't bust cache via ?ver=).
-        #
+        # uncomment below for higher cache-hit ratio:
         # set req.url = regsub(req.url, "\?.*$", "");
 
         return (hash);
@@ -565,14 +585,20 @@ sub vcl_backend_response {
         }
 
         # OPTIONAL: If this is a feed (e.g. /feed/ or ?feed=)
-        # you might want a shorter TTL, for example:
         if (bereq.url ~ "(^|/)feed/" || bereq.url ~ "(\?|&)feed=") {
             set beresp.ttl = 10m;
             set beresp.grace = 1h;
         }
     }
 
-    # 5) If 5xx, short TTL + possible abandon
+    # NEW: Negative caching for 404 or 410 (lightly recommended to reduce repeated
+    #      hits on missing content). You can adjust TTL as needed.
+    if (beresp.status == 404 || beresp.status == 410) {
+        set beresp.ttl   = 30s;
+        set beresp.grace = 5m;
+    }
+
+    # 5) If 5xx, short TTL + possible abandon (already handled above with saintmode)
     if (beresp.status >= 500) {
         set beresp.ttl   = 1s;
         set beresp.grace = 5s;
