@@ -30,6 +30,9 @@ import vtc;  # Optional for local testing or advanced Varnish testcases
 #   -p http_resp_size=64k \
 #   -p http_req_size=64k
 #
+# For HTTP/2 or HTTP/3, place a TLS terminator (e.g., Hitch, HAProxy, Nginx)
+# in front of Varnish to handle TLS + H2/H3. Varnish will still communicate
+# via HTTP/1.1 on the backend side, but we can set alt-svc and other hints.
 ###############################################################################
 
 
@@ -425,7 +428,7 @@ sub vcl_recv {
         set req.grace = 2h + std.random(30m, 3600);
     }
 
-    # NEW: Handle Range requests by passing (can be replaced by slicing logic if desired)
+    # NEW: Handle Range requests by passing (can be replaced by chunk slicing logic if desired)
     if (req.http.Range) {
         return (pass);
     }
@@ -571,6 +574,20 @@ sub vcl_deliver {
 
     # 2) Add global security headers
     call add_security_headers;
+
+    # NEW (HTTP/2 / HTTP/3):
+    # If your TLS terminator supports HTTP/3, you can advertise it with Alt-Svc:
+    # E.g., h3 and h3-29 on port 443 for 24h (86400 seconds).
+    # This does NOT guarantee H3 usage if the front end is not configured.
+    set resp.http.Alt-Svc = "h3=\":443\"; ma=86400, h3-29=\":443\"; ma=86400";
+
+    # Optionally, we can send Link preload headers for commonly used static files
+    # to simulate an H2 "push" style optimization. (Most modern browsers have
+    # removed support for server push, but preload is still useful.)
+    # Example:
+    # if (req.url == "/some-page") {
+    #     set resp.http.Link = "</static/app.css>; rel=preload; as=style, </static/app.js>; rel=preload; as=script";
+    # }
 
     # 3) Debug info if client is in trusted network
     if (client.ip ~ trusted_networks) {
