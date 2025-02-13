@@ -31,8 +31,8 @@ import vtc;  # Optional for local testing or advanced Varnish testcases
 #   -p http_req_size=64k
 #
 # For HTTP/2 or HTTP/3, place a TLS terminator (e.g., Hitch, HAProxy, Nginx)
-# in front of Varnish to handle TLS + H2/H3. Varnish will still communicate
-# via HTTP/1.1 on the backend side, but we can set alt-svc and other hints.
+# in front of Varnish to handle TLS + H2/H3. Varnish will still speak HTTP/1.1
+# to the backend, but you can set Alt-Svc and other hints as below.
 ###############################################################################
 
 
@@ -148,12 +148,19 @@ sub add_security_headers {
     set resp.http.X-XSS-Protection          = "1; mode=block";
     set resp.http.Referrer-Policy           = "strict-origin-when-cross-origin";
     set resp.http.Permissions-Policy        = "interest-cohort=()";
+    # NEW: Add X-Frame-Options
+    set resp.http.X-Frame-Options          = "SAMEORIGIN";
 
     # Minimal default CSP for *.html or *.php
     if (req.url ~ "\.(html|php)$") {
         set resp.http.Content-Security-Policy =
             "default-src 'self' https: 'unsafe-inline' 'unsafe-eval';";
     }
+
+    # Example of setting Access-Control-Allow-Origin for static assets:
+    # if (req.http.X-Static == "1") {
+    #     set resp.http.Access-Control-Allow-Origin = "*";
+    # }
 }
 
 # ------------------------------------------------------------------------------
@@ -194,6 +201,15 @@ sub is_admin_area {
 
 sub is_wp_rest_api {
     if (req.url ~ "^/wp-json/") {
+        return(true);
+    }
+    return(false);
+}
+
+# NEW: WP Preview detection
+sub is_wp_preview {
+    # WordPress previews often have `?preview=true` or `preview_id=`
+    if (req.url ~ "(preview=true|preview_id=)") {
         return(true);
     }
     return(false);
@@ -246,7 +262,7 @@ sub remove_unnecessary_wp_cookies {
                 "\1"
             );
 
-            # NEW: Remove WordPress comment_author_* cookies if not logged in
+            # Remove WordPress comment_author_* cookies if not logged in
             set req.http.Cookie = regsuball(
                 req.http.Cookie,
                 "(^|; )comment_author_[^=]*=[^;]+(; |$)",
@@ -257,6 +273,18 @@ sub remove_unnecessary_wp_cookies {
                 "(^|; )comment_author_email_[^=]*=[^;]+(; |$)",
                 "\1"
             );
+
+            # Optional additional cookie removal if desired:
+            # set req.http.Cookie = regsuball(
+            #     req.http.Cookie,
+            #     "(^|; )_ga=[^;]+(; |$)",
+            #     "\1"
+            # );
+            # set req.http.Cookie = regsuball(
+            #     req.http.Cookie,
+            #     "(^|; )_gid=[^;]+(; |$)",
+            #     "\1"
+            # );
 
             # If the cookie header is now empty or only spaces, unset it
             if (req.http.Cookie ~ "^\s*$") {
@@ -300,10 +328,9 @@ sub vcl_hit {
 }
 
 # ------------------------------------------------------------------------------
-# NEW: Handle WebSockets / CONNECT in vcl_pipe (optional)
+# Handle WebSockets / CONNECT in vcl_pipe
 # ------------------------------------------------------------------------------
 sub vcl_pipe {
-    # If you use WebSockets or CONNECT, ensure we do not break them
     if (req.http.Upgrade ~ "(?i)websocket") {
         return (pipe);
     }
@@ -314,14 +341,14 @@ sub vcl_pipe {
 # vcl_recv: Entry Point for Client Requests
 # ------------------------------------------------------------------------------
 sub vcl_recv {
-    # NEW: Ensure X-Forwarded-For always includes the client IP
+    # 1) Ensure X-Forwarded-For always includes the client IP
     if (!req.http.X-Forwarded-For) {
         set req.http.X-Forwarded-For = client.ip;
     } else {
         set req.http.X-Forwarded-For = req.http.X-Forwarded-For + ", " + client.ip;
     }
 
-    # 1) Socket pacing for large vs. smaller content
+    # 2) Socket pacing for large vs. smaller content
     if (tcp.is_idle(client.socket)) {
         if (req.url ~ "\.(mp4|mkv|iso)$") {
             tcp.set_socket_pace(client.socket, 5MB);
@@ -330,19 +357,19 @@ sub vcl_recv {
         }
     }
 
-    # 2) Normalize host (remove any port suffix)
+    # 3) Normalize host (remove any port suffix)
     set req.http.Host = regsub(req.http.Host, ":[0-9]+", "");
 
-    # 3) Device detection
+    # 4) Device detection
     call detect_device;
 
-    # 4) Clean up query parameters
+    # 5) Clean up query parameters
     call clean_query_parameters;
 
-    # 5) Remove URL fragment, sort query
+    # 6) Remove URL fragment, sort query
     set req.url = std.querysort(regsub(req.url, "#.*$", ""));
 
-    # 6) PURGE checks
+    # 7) PURGE checks
     if (req.method == "PURGE") {
         if (!client.ip ~ purge) {
             return (synth(403, "Forbidden"));
@@ -357,22 +384,22 @@ sub vcl_recv {
         }
     }
 
-    # 7) Pass non-idempotent methods
+    # 8) Pass non-idempotent methods
     if (req.method != "GET" && req.method != "HEAD") {
         return (pass);
     }
 
-    # 8) Basic known-bot checks
+    # 9) Basic known-bot checks
     if (req.http.User-Agent ~ "(?i)(ahrefs|semrush|mj12bot|dotbot|petalbot)") {
         if (vsthrottle.is_denied("bot:" + client.ip, 20, 60s)) {
             return (synth(429, "Bot traffic blocked"));
         }
     }
 
-    # 9) Generic bot/crawler checks (excludes major search engines)
+    # 10) Generic bot/crawler checks (excludes major search engines)
     if (req.http.User-Agent ~ "(?i)(bot|crawl|slurp|spider)") {
         if (req.http.User-Agent !~ "(?i)(googlebot|bingbot|yandex|baiduspider)") {
-            # DNS-based verification
+            # DNS-based verification (example check)
             if (!std.dns("txt", regsub(client.ip, "^([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)$", "\4.\3.\2.\1.in-addr.arpa"))) {
                 if (vsthrottle.is_denied("bot:" + client.ip, 50, 60s)) {
                     unix.syslog(unix.LOG_WARNING, "Generic Bot banned: " + client.ip);
@@ -382,7 +409,7 @@ sub vcl_recv {
         }
     }
 
-    # 10) Rate-limiting for general traffic
+    # 11) Rate-limiting for general traffic
     if (vsthrottle.is_denied(client.ip, 250, 60s)) {
         # Second-level threshold
         if (vsthrottle.is_denied(client.ip, 350, 300s)) {
@@ -392,35 +419,48 @@ sub vcl_recv {
         return (synth(429, "Rate Limited"));
     }
 
-    # 11) WordPress & WooCommerce checks
-    #     - Logged-in user or WP admin -> pass
+    # 12) WordPress & WooCommerce checks
+
+    #     A) If WP Admin area or logged-in user -> pass
     if (is_admin_area() || is_logged_in()) {
         return (pass);
     }
-    #     - wc-ajax, cart, checkout, etc. -> pass
+
+    #     B) If WP Preview => pass
+    if (is_wp_preview()) {
+        return (pass);
+    }
+
+    #     C) WooCommerce & WP special endpoints => pass
     if (req.url ~ "wc-ajax=") {
         return (pass);
     }
     if (req.url ~ "(wp-admin|wp-login|wc-api|checkout|cart|my-account|add-to-cart|logout|lost-password)") {
         return (pass);
     }
-    #     - WP REST API (optional)
+
+    #     D) WP REST API (optional)
     if (is_wp_rest_api()) {
         return (pass);
     }
 
-    # NEW FEATURE:
-    # Remove non-critical WP cookies for non-logged-in users
+    #     E) Remove non-critical WP cookies for non-logged-in users
     call remove_unnecessary_wp_cookies;
 
-    # 12) Static file handling
+    # 13) Static file handling
     if (req.url ~ "(?i)\.(7z|avi|bmp|bz2|css|csv|doc|docx|eot|flac|flv|gif|gz|ico|jpe?g|js|less|mka|mkv|mov|mp3|mp4|mpeg|mpg|odt|otf|ogg|ogm|opus|pdf|png|ppt|pptx|rar|rtf|svgz?|swf|tar|tbz|tgz|ttf|txt|txz|wav|web[mp]|woff2?|xlsx|xml|xz|zip)(\?.*)?$") {
         unset req.http.Cookie;
         set req.http.X-Static = "1";
+
+        # OPTIONAL: If you want to ignore query strings on static (like ?ver=123),
+        # uncomment below for higher cache-hit ratio (but also means WP can't bust cache via ?ver=).
+        #
+        # set req.url = regsub(req.url, "\?.*$", "");
+
         return (hash);
     }
 
-    # 13) Grace for dynamic content
+    # 14) Grace for dynamic content
     if (req.http.X-Grace) {
         set req.grace = std.duration(req.http.X-Grace, 24h);
     } else {
@@ -428,12 +468,12 @@ sub vcl_recv {
         set req.grace = 2h + std.random(30m, 3600);
     }
 
-    # NEW: Handle Range requests by passing (can be replaced by chunk slicing logic if desired)
+    # 15) Handle Range requests by passing (can be replaced by chunk slicing logic)
     if (req.http.Range) {
         return (pass);
     }
 
-    # NEW: Handle WP Heartbeat (short Ajax requests)
+    # 16) Handle WP Heartbeat (short Ajax requests)
     if (req.url ~ "wp-admin/admin-ajax.php" && req.http.body ~ "action=heartbeat") {
         return (pass);
     }
@@ -447,6 +487,7 @@ sub vcl_recv {
 sub vcl_backend_fetch {
     # (A) Ensure we get compressed data from the backend if available
     if (bereq.http.Accept-Encoding) {
+        # If your backend supports brotli, keep "br"
         set bereq.http.Accept-Encoding = "gzip, deflate, br";
     } else {
         set bereq.http.Accept-Encoding = "gzip, deflate";
@@ -487,12 +528,14 @@ sub vcl_backend_response {
         xkey.add(beresp.http.X-Purge-Keys);
     }
 
-    # 3) Static asset caching
-    if (bereq.http.X-Static == "1" || bereq.url ~ "\.(?i)(css|js|jpg|jpeg|png|gif|ico|woff2)$") {
+    # 3) Detect static
+    if (bereq.http.X-Static == "1" ||
+        bereq.url ~ "\.(?i)(css|js|jpg|jpeg|png|gif|ico|woff2)$") {
+
         set beresp.ttl        = 365d;
         set beresp.grace      = 7d;
         set beresp.keep       = 7d;
-        # Add stale-while-revalidate/stale-if-error
+
         set beresp.http.Cache-Control =
             "public, max-age=31536000, immutable, stale-while-revalidate=86400, stale-if-error=86400";
         set beresp.http.Vary  = "Accept-Encoding";
@@ -510,16 +553,22 @@ sub vcl_backend_response {
                 set beresp.do_gzip = true;
             }
         }
-    }
-    else {
+
+    } else {
         # 4) Dynamic content default TTL
         if (!beresp.http.Cache-Control) {
             set beresp.ttl   = 4h;
             set beresp.grace = 24h;
             set beresp.keep  = 24h;
-            # Add stale-while-revalidate, stale-if-error
             set beresp.http.Cache-Control =
                 "public, max-age=14400, stale-while-revalidate=3600, stale-if-error=43200";
+        }
+
+        # OPTIONAL: If this is a feed (e.g. /feed/ or ?feed=)
+        # you might want a shorter TTL, for example:
+        if (bereq.url ~ "(^|/)feed/" || bereq.url ~ "(\?|&)feed=") {
+            set beresp.ttl = 10m;
+            set beresp.grace = 1h;
         }
     }
 
@@ -546,14 +595,13 @@ sub vcl_backend_response {
         }
     }
 
-    # NEW: Optionally slice big files if you want partial caching with chunk vmod
-    #      (This is an alternative to returning pass for Range requests.)
+    # OPTIONAL: Use chunk vmod for partial caching if you prefer,
+    # especially for big range-based downloads:
     # if (bereq.http.Range) {
-    #     # For example, slice into 1MB segments
     #     chunk.slice(beresp, 1MB);
     # }
 
-    # NEW: Optionally generate ETag if the backend doesn't provide one and content is suitable
+    # NEW: Optionally generate ETag if none is provided
     if (!beresp.http.ETag &&
         (beresp.http.content-type ~ "text" ||
          beresp.http.content-type ~ "application/json" ||
@@ -575,16 +623,10 @@ sub vcl_deliver {
     # 2) Add global security headers
     call add_security_headers;
 
-    # NEW (HTTP/2 / HTTP/3):
-    # If your TLS terminator supports HTTP/3, you can advertise it with Alt-Svc:
-    # E.g., h3 and h3-29 on port 443 for 24h (86400 seconds).
-    # This does NOT guarantee H3 usage if the front end is not configured.
+    # HTTP/2 / HTTP/3 advertisement
     set resp.http.Alt-Svc = "h3=\":443\"; ma=86400, h3-29=\":443\"; ma=86400";
 
-    # Optionally, we can send Link preload headers for commonly used static files
-    # to simulate an H2 "push" style optimization. (Most modern browsers have
-    # removed support for server push, but preload is still useful.)
-    # Example:
+    # Example: Preload critical assets (replacing old server push)
     # if (req.url == "/some-page") {
     #     set resp.http.Link = "</static/app.css>; rel=preload; as=style, </static/app.js>; rel=preload; as=script";
     # }
